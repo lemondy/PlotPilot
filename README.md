@@ -69,10 +69,10 @@
 
 ```bash
 # 后端
-python -m venv .venv && .venv\Scripts\activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-copy .env.example .env    # 填写 LLM 凭证
-uvicorn interfaces.main:app --host 127.0.0.1 --port 8005 --reload
+cp .env.example .env    # 填写 LLM 凭证
+.venv/bin/uvicorn interfaces.main:app --host 127.0.0.1 --port 8005 --reload
 
 # 前端（另开终端）
 cd frontend && npm install && npm run dev
