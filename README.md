@@ -65,17 +65,25 @@
 
 ## 开发者启动
 
-**环境要求**：Python 3.9+、Node.js 18+
+**环境要求**：Python 3.9+、Node.js 20.19+ 或 22.12+（Vite 7 要求）
+
+> **Node.js 版本检查**：运行 `node -v` 确认版本号。如果不满足要求，可通过 nvm 切换：
+> ```bash
+> nvm ls                        # 查看本地已安装的版本
+> nvm install 22                # 如果没有合适版本则安装
+> nvm use 22                    # 切换到 22.x
+> ```
 
 ```bash
 # 后端
-python -m venv .venv && .venv\Scripts\activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-copy .env.example .env    # 填写 LLM 凭证
-uvicorn interfaces.main:app --host 127.0.0.1 --port 8005 --reload
+cp .env.example .env    # 填写 LLM 凭证
+.venv/bin/uvicorn interfaces.main:app --host 127.0.0.1 --port 8005 --reload
 
 # 前端（另开终端）
 cd frontend && npm install && npm run dev
+
 ```
 
 后端 API：`http://127.0.0.1:8005` · 文档：`http://127.0.0.1:8005/docs` · 前端：`http://localhost:3000`
