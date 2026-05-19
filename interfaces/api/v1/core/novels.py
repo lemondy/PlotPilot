@@ -31,7 +31,7 @@ class CreateNovelRequest(BaseModel):
         ge=0,
         description="目标章节数；选 V1 体量档时可传 0 由服务端推导",
     )
-    premise: str = Field(default="", max_length=2000, description="故事梗概/创意（建议 2000 字内）")
+    premise: str = Field(default="", max_length=5000, description="故事梗概/创意（建议 5000 字内）")
     genre: str = Field(default="", description="赛道/类型（下拉预设）")
     world_preset: str = Field(default="", description="世界观基调（下拉预设）")
     length_tier: Optional[Literal["short", "standard", "epic"]] = Field(

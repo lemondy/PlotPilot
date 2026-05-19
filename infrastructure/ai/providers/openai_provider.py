@@ -109,20 +109,28 @@ class OpenAIProvider(BaseProvider):
         prompt: Prompt,
         config: GenerationConfig
     ) -> AsyncIterator[str]:
+        import asyncio
         try:
             base_url = self.settings.base_url or "https://api.openai.com/v1"
             use_responses = not self._use_legacy and base_url not in self.__class__._fallback_to_chat_cache
 
             if use_responses:
                 try:
+                    logger.info(f"[Stream] 使用 Responses API: {base_url}")
                     # 尝试走 Responses 流式 API
                     request_kwargs = self._build_responses_request_kwargs(prompt, config, stream=True)
-                    stream = await self.async_client.responses.create(**request_kwargs)
+                    stream = await asyncio.wait_for(
+                        self.async_client.responses.create(**request_kwargs),
+                        timeout=self.settings.timeout_seconds
+                    )
                     async for chunk in stream:
                         content = self._extract_text_from_responses_chunk(chunk)
                         if content:
                             yield content
                     return  # 正常完成则结束 generator
+                except asyncio.TimeoutError:
+                    logger.warning(f"[Stream] Responses API 连接超时 ({self.settings.timeout_seconds}s)，降级到 Chat Completions")
+                    self.__class__._fallback_to_chat_cache.add(base_url)
                 except (openai.NotFoundError, openai.BadRequestError):
                     self.__class__._fallback_to_chat_cache.add(base_url)
                     logger.info(f"Stream: Responses API unsupported for {base_url}, falling back.")
@@ -135,13 +143,20 @@ class OpenAIProvider(BaseProvider):
                         raise
 
             # 降级：走原来的 Chat Completions 流式 API
+            logger.info(f"[Stream] 使用 Chat Completions API (legacy={self._use_legacy}): {base_url}")
             messages = self._build_messages(prompt)
             request_kwargs = self._build_chat_request_kwargs(messages, config, stream=True)
-            stream = await self.async_client.chat.completions.create(**request_kwargs)
+            stream = await asyncio.wait_for(
+                self.async_client.chat.completions.create(**request_kwargs),
+                timeout=self.settings.timeout_seconds
+            )
             async for chunk in stream:
                 content = self._extract_text_from_stream_chunk(chunk)
                 if content:
                     yield content
+        except asyncio.TimeoutError:
+            logger.error(f"[Stream] Chat Completions API 连接超时 ({self.settings.timeout_seconds}s)")
+            raise RuntimeError(f"Stream connection timed out after {self.settings.timeout_seconds}s")
         except Exception as e:
             logger.error(f"[Stream] Failed: {e}")
             raise RuntimeError(f"Failed to stream text: {str(e)}") from e
@@ -284,7 +299,13 @@ class OpenAIProvider(BaseProvider):
 
         message = getattr(response.choices[0], "message", None)
         content = getattr(message, "content", None)
-        return OpenAIProvider._normalize_chat_completion_content(content)
+        text = OpenAIProvider._normalize_chat_completion_content(content)
+        # 某些代理（如 o1/gpt-5）将正文放在 reasoning_content 中，content 为空
+        if not text:
+            reasoning = getattr(message, "reasoning_content", None)
+            if isinstance(reasoning, str) and reasoning.strip():
+                text = reasoning.strip()
+        return text
 
     @staticmethod
     def _extract_text_from_stream_chunk(chunk: Any) -> str:
@@ -296,7 +317,13 @@ class OpenAIProvider(BaseProvider):
         if isinstance(content, str):
             return content
         if isinstance(content, list):
-            return OpenAIProvider._normalize_chat_completion_content(content)
+            text = OpenAIProvider._normalize_chat_completion_content(content)
+            if text:
+                return text
+        # 某些代理（如 o1/gpt-5）将正文放在 reasoning_content 中
+        reasoning = getattr(delta, "reasoning_content", None)
+        if isinstance(reasoning, str) and reasoning:
+            return reasoning
         return ""
 
     async def _generate_via_stream(self, request_kwargs: dict[str, Any]) -> tuple[str, TokenUsage]:

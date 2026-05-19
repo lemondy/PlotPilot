@@ -85,6 +85,10 @@ class AutopilotDaemon:
         self.foreshadowing_repository = foreshadowing_repository
         self.knowledge_service = knowledge_service
         
+        # Humanizer 服务：去除 AI 写作痕迹
+        from application.engine.services.humanizer_service import HumanizerService
+        self.humanizer_service = HumanizerService(llm_service) if llm_service else None
+
         # 惰性初始化 VolumeSummaryService
         if not self.volume_summary_service and llm_service and story_node_repo:
             from application.blueprint.services.volume_summary_service import VolumeSummaryService
@@ -279,6 +283,7 @@ class AutopilotDaemon:
             novel_id=novel.novel_id.value,
             target_chapters=target_chapters,
             structure_preference=None,
+            premise=getattr(novel, 'premise', '') or "",
         )
 
         if not self._is_still_running(novel):
@@ -557,6 +562,10 @@ class AutopilotDaemon:
         context = ""
         if self.chapter_workflow:
             try:
+                logger.info(f"[{novel.novel_id}]    ⏳ 开始组装上下文 (prepare_chapter_generation)...")
+                import sys; sys.stdout.flush(); sys.stderr.flush()
+                for h in logging.getLogger().handlers:
+                    h.flush()
                 bundle = self.chapter_workflow.prepare_chapter_generation(
                     novel.novel_id.value, chapter_num, outline, scene_director=None
                 )
@@ -628,6 +637,7 @@ class AutopilotDaemon:
         chapter_content = await self._get_existing_chapter_content(novel, chapter_num) or ""
 
         use_wf = self.chapter_workflow is not None and bundle is not None
+        logger.info(f"[{novel.novel_id}]    ⏳ 上下文组装完成，开始生成正文 (use_wf={use_wf}, beats={len(beats) if beats else 0})")
 
         if beats:
             for i, beat in enumerate(beats):
@@ -654,10 +664,9 @@ class AutopilotDaemon:
                         chapter_draft_so_far=chapter_content,
                     )
                     # 字数控制策略：
-                    # - prompt 中要求目标的 75%（在 context_builder 中处理）
-                    # - max_tokens = prompt 目标 × 1.1（硬性上限，超出会被截断）
-                    # - 最终输出应接近 prompt 目标，略低于原始目标
-                    max_tokens = int(beat.target_words * 1.1)
+                    # - 中文约 1.5-2 tokens/字，使用 2.0 倍确保充足 token 预算
+                    # - max_tokens 是硬性上限，不足会导致输出被截断
+                    max_tokens = int(beat.target_words * 2.0)
                     cfg = GenerationConfig(max_tokens=max_tokens, temperature=0.85)
                     beat_content = await self._stream_llm_with_stop_watch(prompt, cfg, novel=novel)
                 else:
@@ -737,6 +746,20 @@ class AutopilotDaemon:
                 logger.info(f"[{novel.novel_id}]    ✅ post_process_generated_chapter 完成")
             except Exception as e:
                 logger.warning(f"post_process_generated_chapter 失败（仍落库）：{e}")
+
+        # 6.5 Humanizer：去除 AI 写作痕迹，改写对话使其贴合人物性格和情景
+        if chapter_content.strip() and self.humanizer_service:
+            if not self._is_still_running(novel):
+                logger.info(f"[{novel.novel_id}] 用户已停止，跳过 Humanizer")
+            else:
+                character_context = self._get_character_context_for_humanizer(novel, chapter_num)
+                chapter_content = await self.humanizer_service.humanize_chapter(
+                    content=chapter_content,
+                    character_context=character_context,
+                    novel_id=novel.novel_id.value,
+                    chapter_num=chapter_num,
+                )
+                await self._upsert_chapter_content(novel, next_chapter_node, chapter_content, status="draft")
 
         # 7. 章节完成，标记 completed（带字数验证）
         actual_word_count = len(chapter_content.strip())
@@ -1252,24 +1275,34 @@ class AutopilotDaemon:
         if not content or len(content) < 200:
             return 5  # 默认中等张力
 
-        snippet = content[:500]  # 只取前 500 字，节省 token
+        # 取首尾各 300 字，让模型看到开头和高潮/结尾
+        head = content[:300]
+        tail = content[-300:] if len(content) > 600 else ""
+        snippet = head + ("\n...\n" + tail if tail else "")
 
         try:
             prompt = Prompt(
-                system="你是小说节奏分析师，只输出一个 1-10 的整数，不要解释。",
-                user=f"""根据以下章节开头，打分当前剧情的张力值（1=日常/轻松，10=生死对决/高潮）：
+                system="只输出一个1到10的整数。不要分析，不要解释，不要任何其他文字。只输出数字。",
+                user=f"""给下面的小说章节打张力分。1=日常闲聊，5=中等冲突，8=激烈对抗，10=生死决战。
 
 {snippet}
 
-张力分（只输出数字）："""
+张力分="""
             )
-            config = GenerationConfig(max_tokens=5, temperature=0.1)
+            # 推理模型会消耗大量 reasoning tokens，给 200 确保实际输出有余量
+            config = GenerationConfig(max_tokens=200, temperature=0.1)
             result = await self.llm_service.generate(prompt, config)
             raw = result.content.strip() if hasattr(result, "content") else str(result).strip()
-            score = int(''.join(filter(str.isdigit, raw[:3])))
-            return max(1, min(10, score))
-        except Exception:
-            return 5  # 解析失败，返回默认值
+            # 从结果中提取数字（可能混有推理文字）
+            digits = ''.join(filter(str.isdigit, raw[:10]))
+            if digits:
+                score = int(digits[:2])  # 最多取两位
+                return max(1, min(10, score))
+            logger.warning(f"张力评分无法解析数字: '{raw[:50]}'")
+            return 5
+        except Exception as e:
+            logger.warning(f"张力评分失败: {e}")
+            return 5
 
     async def _stream_llm_with_stop_watch(
         self, prompt: Prompt, config: GenerationConfig, novel=None
@@ -1277,7 +1310,10 @@ class AutopilotDaemon:
         """与 workflow 共用同一套 Prompt + LLM；novel 传入时并行轮询 DB 是否已停止。
         
         流式生成时会实时推送增量文字到 streaming_callback（如果设置）。
+        包含单 chunk 读超时保护（120 秒无数据即超时），防止代理无响应时永久挂起。
         """
+        CHUNK_TIMEOUT = 120  # 单个 chunk 最长等待秒数
+
         content = ""
         stop_detected = asyncio.Event()
         watch_task = None
@@ -1297,8 +1333,16 @@ class AutopilotDaemon:
             watch_task = asyncio.create_task(_watch_stop_from_db())
 
         try:
-            async for chunk in self.llm_service.stream_generate(prompt, config):
+            stream_iter = self.llm_service.stream_generate(prompt, config).__aiter__()
+            while True:
                 if novel is not None and stop_detected.is_set():
+                    break
+                try:
+                    chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=CHUNK_TIMEOUT)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    logger.warning(f"[{nid}] ⏱️ 流式读取超时（{CHUNK_TIMEOUT}s 无数据），中断本次生成")
                     break
                 content += chunk
                 
@@ -1421,13 +1465,15 @@ class AutopilotDaemon:
                 "【角色声线与肢体语言（Bible 锚点，必须遵守）】\n"
                 f"{va}\n\n"
             )
-        system = f"""你是一位资深网文作家，擅长写爽文。
-{voice_block}写作要求：
-1. 严格按节拍字数和聚焦点写作
-2. 必须有对话和人物互动，保持人物性格一致
-3. 增加感官细节：视觉、听觉、触觉、情绪
-4. 节奏控制：不要一章推进太多剧情
-5. 不要写章节标题"""
+        system = f"""你是一位真实的网文作家，用自己的风格写作。
+{voice_block}写作铁律：
+1. 对话占40%以上，口语化（允许省略、语气词、打断），不同角色腔调不同
+2. 禁止堆砌感官——每场景只写1-2个最有冲击力的细节
+3. 禁止"不仅……而且""随着""与此同时"等模式化连接词
+4. 每段必须推进情节或揭示角色，禁止空转和灌水
+5. 情感靠动作传递（"他攥紧拳头"而非"他感到愤怒"）
+6. 段落长度参差不齐，不写章节标题
+禁用词：此外、值得注意的是、不言而喻、充满活力、不可磨灭、应运而生"""
 
         user_parts = []
         if context:
@@ -1443,12 +1489,39 @@ class AutopilotDaemon:
             user_parts.append(f"\n{beat_prompt}")
         user_parts.append("\n\n开始撰写：")
 
-        # 字数控制策略（与主流程一致）
-        max_tokens = int(beat.target_words * 1.1) if beat else 3000
+        # 字数控制策略（与主流程一致，中文约 2 tokens/字）
+        max_tokens = int(beat.target_words * 2.0) if beat else 3000
 
         prompt = Prompt(system=system, user="\n".join(user_parts))
         config = GenerationConfig(max_tokens=max_tokens, temperature=0.85)
         return await self._stream_llm_with_stop_watch(prompt, config, novel=novel)
+
+    def _get_character_context_for_humanizer(self, novel, chapter_num: int) -> str:
+        """从 Bible 中获取角色信息，供 Humanizer 改写对话时参考"""
+        try:
+            if not self.chapter_workflow or not hasattr(self.chapter_workflow, 'bible_repository'):
+                return ""
+            bible_repo = self.chapter_workflow.bible_repository
+            if not bible_repo:
+                return ""
+            bible = bible_repo.get_by_novel_id(novel.novel_id)
+            if not bible:
+                return ""
+            lines = []
+            for c in bible.characters[:8]:
+                desc = getattr(c, 'description', '') or ''
+                verbal_tic = getattr(c, 'verbal_tic', '') or ''
+                mental = getattr(c, 'mental_state', '') or ''
+                line = f"- {c.name}：{desc}"
+                if verbal_tic:
+                    line += f"（口癖：{verbal_tic}）"
+                if mental:
+                    line += f"（当前心理：{mental}）"
+                lines.append(line)
+            return "\n".join(lines)
+        except Exception as e:
+            logger.debug(f"获取角色上下文失败：{e}")
+            return ""
 
     async def _upsert_chapter_content(self, novel, chapter_node, content: str, status: str):
         """最小事务：只更新章节内容，不涉及其他表

@@ -299,6 +299,7 @@ class ContinuousPlanningService:
         novel_id: str,
         target_chapters: int,
         structure_preference: Optional[Dict[str, int]] = None,
+        premise: str = "",
     ) -> Dict:
         """生成宏观规划"""
         import time
@@ -310,6 +311,10 @@ class ContinuousPlanningService:
         # 获取 Bible 信息
         bible_context = self._get_bible_context(novel_id)
 
+        # 注入 premise（梗概锁定）到上下文
+        if premise:
+            bible_context["premise"] = premise
+
         try:
             if structure_preference is None:
                 # 构建提示词
@@ -318,6 +323,10 @@ class ContinuousPlanningService:
                     target_chapters=target_chapters,
                     structure_preference=structure_preference
                 )
+
+                # 打印完整 prompt 到日志
+                logger.info(f"[MacroPlan] ===== SYSTEM PROMPT =====\n{prompt.system}")
+                logger.info(f"[MacroPlan] ===== USER PROMPT =====\n{prompt.user}")
 
                 # 调用 LLM 生成规划
                 config = GenerationConfig(max_tokens=4096, temperature=0.7)
@@ -1268,15 +1277,35 @@ class ContinuousPlanningService:
         if not bible:
             return {}
 
+        # 将 world_settings 拼接成一段可读的世界观文本
+        worldview_parts = []
+        for w in bible.world_settings:
+            if w.name and w.description:
+                worldview_parts.append(f"- {w.name}：{w.description}")
+            elif w.description:
+                worldview_parts.append(f"- {w.description}")
+        worldview_text = "\n".join(worldview_parts) if worldview_parts else ""
+
+        # 将 style_notes 拼接成文风公约文本
+        style_parts = []
+        for s in bible.style_notes:
+            content = getattr(s, 'content', '') or ''
+            category = getattr(s, 'category', '') or ''
+            if content:
+                style_parts.append(f"[{category}] {content}" if category else content)
+        style_text = "\n".join(style_parts) if style_parts else ""
+
         return {
             "characters": [{"id": c.id, "name": c.name, "description": c.description}
                            for c in bible.characters],
             "world_settings": [{"id": w.id, "name": w.name, "description": w.description}
                                for w in bible.world_settings],
+            "worldview": worldview_text,
             "locations": [{"id": l.id, "name": l.name, "description": l.description}
                           for l in bible.locations],
             "timeline_notes": [{"id": t.id, "event": t.event, "description": t.description}
                                for t in bible.timeline_notes],
+            "style_notes": style_text,
         }
 
     def _create_node_from_data(
@@ -1585,7 +1614,9 @@ class ContinuousPlanningService:
 """
         
         system_msg = f"""# 角色设定
-你是一位狂热且极具市场敏锐度的顶级网文主编，精通"退婚流"、"克苏鲁修仙"、"赛博朋克反乌托邦"等各种爆款商业节奏。你的任务是帮作者打破"白纸恐惧"，利用他给出的世界观设定，瞬间推演填补出一个完整、宏大、且充满极端冲突的长篇叙事骨架。
+你是一位专业且极具市场敏锐度的顶级小说策划编辑，精通各种题材的商业叙事节奏。你的任务是帮作者利用他给出的世界观设定和故事梗概，推演出一个完整、宏大、且充满冲突的长篇叙事骨架。
+
+【最高优先级铁律】你必须严格遵循用户提供的故事梗概、世界观和题材设定。如果故事梗概标注为"现代都市"，那么大纲中绝对不能出现修仙、宗门、魔门、仙侠等与设定不符的元素。所有命名、场景、冲突类型都必须贴合用户指定的题材。
 
 {depth_instruction}
 
@@ -1613,7 +1644,9 @@ class ContinuousPlanningService:
    - 赌注（失败会失去什么）
    - 转折（预期违背）
 
-3. 【世界观融合】必须深度融合提供的设定：
+3. 【世界观融合（最高优先级）】必须严格遵循故事梗概和世界观设定：
+   - 所有部/卷/幕的标题、情节、角色、场景必须与用户指定题材一致
+   - 如果是现代都市题材，禁止出现修仙、宗门、魔门、仙侠、功法、灵气等不符元素
    - 主要角色必须出现在关键幕中
    - 关键地点必须承担叙事功能
    - 时间线事件必须影响情节走向
@@ -1642,9 +1675,17 @@ class ContinuousPlanningService:
         # 构建丰富的世界观上下文
         context_parts = []
 
+        # 故事梗概/核心设定（premise）
+        if bible_context.get("premise"):
+            context_parts.append(f"【故事梗概/核心设定】\n{bible_context['premise']}\n")
+
         # 世界观
         if bible_context.get("worldview"):
             context_parts.append(f"【世界观】\n{bible_context['worldview']}\n")
+
+        # 文风公约
+        if bible_context.get("style_notes"):
+            context_parts.append(f"【文风公约】\n{bible_context['style_notes']}\n")
 
         # 角色（带关系和弧光）
         if bible_context.get("characters"):

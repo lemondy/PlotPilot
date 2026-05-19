@@ -62,6 +62,8 @@ class Novel(BaseEntity):
         target_words_per_chapter: int = 2500,
         # 审计进度指示
         audit_progress: Optional[str] = None,
+        # 创建时间
+        created_at: Optional[str] = None,
     ):
         super().__init__(id.value)
         self.novel_id = id

@@ -752,6 +752,7 @@ async def plan_novel(
             novel_id=novel_id,
             target_chapters=novel.target_chapters,
             structure_preference=None,
+            premise=novel.premise or "",
         )
         logger.info(f"[PlanNovel] Macro plan generated, persisting (shared path with autopilot)")
 

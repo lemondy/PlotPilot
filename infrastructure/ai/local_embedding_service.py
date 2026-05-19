@@ -111,10 +111,13 @@ class LocalEmbeddingService(EmbeddingService):
                     f"或者切换到 OpenAI API 模式以跳过本地模型。"
                 )
 
-        # 检测设备
+        # 检测设备：CUDA > MPS (Apple Silicon) > CPU
         if use_gpu and torch.cuda.is_available():
             device = 'cuda'
             logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        elif use_gpu and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = 'mps'
+            logger.info("Using Apple MPS (Metal Performance Shaders)")
         else:
             device = 'cpu'
             logger.info("Using CPU")

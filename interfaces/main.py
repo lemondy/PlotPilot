@@ -294,6 +294,48 @@ def _stop_all_running_novels():
         logger.error(f"❌ 停止运行中小说失败: {e}", exc_info=True)
 
 
+def _run_daemon_in_thread(stop_event: threading.Event, stream_queue=None):
+    """在线程中运行守护进程（共享主进程内存，兼容本地嵌入模型）"""
+    # 注入流式队列
+    if stream_queue is not None:
+        from application.engine.services.streaming_bus import inject_stream_queue
+        inject_stream_queue(stream_queue)
+        logger.info("✅ 守护进程（线程模式）：流式队列已注入")
+
+    try:
+        from scripts.start_daemon import build_daemon
+        daemon = build_daemon()
+        logger.info("🚀 守护进程已启动（线程模式），开始轮询...")
+
+        while not stop_event.is_set():
+            try:
+                active_novels = daemon._get_active_novels()
+
+                if active_novels:
+                    import asyncio
+                    for novel in active_novels:
+                        if stop_event.is_set():
+                            break
+                        asyncio.run(daemon._process_novel(novel))
+
+                stop_event.wait(timeout=daemon.poll_interval)
+
+            except BaseException as e:
+                if stop_event.is_set() or _is_expected_daemon_shutdown_exception(e):
+                    logger.info("ℹ️ 守护进程在停止/热重载期间中断，正常退出")
+                    break
+                logger.error(f"❌ 守护进程异常: {e}", exc_info=True)
+                stop_event.wait(timeout=10)
+
+    except BaseException as e:
+        if stop_event.is_set() or _is_expected_daemon_shutdown_exception(e):
+            logger.info("ℹ️ 守护进程收到停止信号，正常退出")
+        else:
+            logger.error(f"❌ 守护进程初始化失败: {e}", exc_info=True)
+    finally:
+        logger.info("🛑 守护进程（线程模式）已停止")
+
+
 def _run_daemon_in_process(
     stop_event: threading.Event, 
     log_level: int, 
@@ -356,7 +398,7 @@ def _run_daemon_in_process(
 
 
 def _start_autopilot_daemon_thread():
-    """启动自动驾驶守护进程（独立进程，不阻塞主事件循环）"""
+    """启动自动驾驶守护进程（线程模式，共享主进程内存，兼容本地嵌入模型）"""
     global _daemon_process, _daemon_stop_event
     
     if _daemon_process is not None and _daemon_process.is_alive():
@@ -368,23 +410,21 @@ def _start_autopilot_daemon_thread():
         logger.info("🔒 守护进程自动启动已禁用（DISABLE_AUTO_DAEMON=1）")
         return
     
-    # 重要：在启动守护进程前初始化 StreamingBus 的队列
-    # 使用普通 Queue（可以 pickle 序列化传递给子进程）
+    # 初始化 StreamingBus 的队列
     from application.engine.services.streaming_bus import init_streaming_bus
     stream_queue = init_streaming_bus()
     
-    _daemon_stop_event = multiprocessing.Event()
+    _daemon_stop_event = threading.Event()
     
-    # 使用独立进程运行守护进程，完全隔离于主进程的事件循环
-    # 将队列传递给守护进程，实现跨进程通信
-    _daemon_process = multiprocessing.Process(
-        target=_run_daemon_in_process,
-        args=(_daemon_stop_event, log_level, log_file, stream_queue),
+    # 使用线程模式：共享主进程内存，避免 macOS 上 PyTorch/FAISS 多进程死锁
+    _daemon_process = threading.Thread(
+        target=_run_daemon_in_thread,
+        args=(_daemon_stop_event, stream_queue),
         name="AutopilotDaemon",
         daemon=True,
     )
     _daemon_process.start()
-    logger.info("✅ 守护进程已创建并启动（独立进程模式，流式队列已传递）")
+    logger.info("✅ 守护进程已创建并启动（线程模式，兼容本地嵌入模型）")
 
 
 def _cleanup_orphan_python_processes():
@@ -447,7 +487,7 @@ def _cleanup_orphan_python_processes():
 
 
 def _stop_autopilot_daemon_thread():
-    """停止守护进程"""
+    """停止守护进程（兼容线程和进程模式）"""
     global _daemon_process, _daemon_stop_event
 
     if _daemon_stop_event:
@@ -455,20 +495,20 @@ def _stop_autopilot_daemon_thread():
         _daemon_stop_event.set()
 
     if _daemon_process and _daemon_process.is_alive():
-        _daemon_process.join(timeout=2)  # 减少等待时间到2秒
+        _daemon_process.join(timeout=5)
         if _daemon_process.is_alive():
-            logger.warning("⚠️  守护进程未在超时时间内停止，强制终止")
-            _daemon_process.terminate()
-            _daemon_process.join(timeout=1)
-            # 如果还是活着，强制kill
-            if _daemon_process.is_alive():
-                logger.warning("⚠️  守护进程仍未停止，使用 SIGKILL")
-                try:
-                    import signal
-                    import os
-                    os.kill(_daemon_process.pid, signal.SIGKILL)
-                except Exception as e:
-                    logger.error(f"强制终止守护进程失败: {e}")
+            logger.warning("⚠️  守护进程未在超时时间内停止")
+            # 仅 multiprocessing.Process 支持 terminate
+            if hasattr(_daemon_process, 'terminate'):
+                _daemon_process.terminate()
+                _daemon_process.join(timeout=1)
+                if _daemon_process.is_alive():
+                    logger.warning("⚠️  守护进程仍未停止，使用 SIGKILL")
+                    try:
+                        import signal
+                        os.kill(_daemon_process.pid, signal.SIGKILL)
+                    except Exception as e:
+                        logger.error(f"强制终止守护进程失败: {e}")
         else:
             logger.info("✅ 守护进程已成功停止")
 

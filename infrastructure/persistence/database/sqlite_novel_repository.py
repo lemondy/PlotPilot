@@ -217,6 +217,7 @@ class SqliteNovelRepository(NovelRepository):
             last_audit_issues=lai,
             target_words_per_chapter=row.get("target_words_per_chapter", 2500),
             audit_progress=row.get("audit_progress"),
+            created_at=row.get("created_at"),
         )
 
     def delete(self, novel_id: NovelId) -> None:

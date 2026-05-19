@@ -230,6 +230,9 @@
                     </n-tag>
                     <span class="meta-genre">{{ book.genre || '未分类' }}</span>
                   </div>
+                  <div class="card-date" v-if="book.created_at">
+                    <span>{{ formatDate(book.created_at) }}</span>
+                  </div>
                   <div class="card-stats" v-if="book.chapter_count || book.word_count">
                     <template v-if="book.chapter_count">
                       <span>{{ book.chapter_count }} 章</span>
@@ -372,6 +375,9 @@
               </n-tag>
               <span class="meta-genre">{{ book.genre || '未分类' }}</span>
             </div>
+            <div class="card-date" v-if="book.created_at">
+              <span>{{ formatDate(book.created_at) }}</span>
+            </div>
             <div class="card-stats" v-if="book.chapter_count || book.word_count">
               <template v-if="book.chapter_count">
                 <span>{{ book.chapter_count }} 章</span>
@@ -480,7 +486,7 @@ const selectedBooks = ref<string[]>([])
 const showBatchDeleteConfirm = ref(false)
 const batchDeleting = ref(false)
 
-const PREMISE_MAX_LEN = 2000
+const PREMISE_MAX_LEN = 5000
 
 const newBook = ref({
   title: '',
@@ -592,6 +598,7 @@ const fetchBooks = async () => {
       genre: '',
       chapter_count: novel.chapters?.length || 0,
       word_count: novel.total_word_count,
+      created_at: novel.created_at,
     }))
   } catch {
     message.error('加载失败')
@@ -615,6 +622,19 @@ const formatWordCount = (count: number): string => {
     return (count / 10000).toFixed(1) + '万字'
   }
   return count + '字'
+}
+
+const formatDate = (dateStr: string): string => {
+  if (!dateStr) return ''
+  const d = new Date(dateStr)
+  if (isNaN(d.getTime())) return ''
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  const h = String(d.getHours()).padStart(2, '0')
+  const min = String(d.getMinutes()).padStart(2, '0')
+  const s = String(d.getSeconds()).padStart(2, '0')
+  return `${y}-${m}-${day} ${h}:${min}:${s}`
 }
 
 const handleCreate = async () => {
@@ -1151,6 +1171,13 @@ onMounted(() => {
 .meta-genre {
   font-size: 12px;
   color: var(--app-text-muted);
+}
+
+/* 创作日期 */
+.card-date {
+  font-size: 11px;
+  color: var(--app-text-muted);
+  margin-bottom: 6px;
 }
 
 /* 卡片统计信息 */

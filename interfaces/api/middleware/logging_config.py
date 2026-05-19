@@ -1,6 +1,7 @@
 """Unified logging configuration module."""
 
 import logging
+import logging.handlers
 import os
 from typing import Optional
 
@@ -135,7 +136,15 @@ def setup_logging(
                 format_string,
                 datefmt="%Y-%m-%d %H:%M:%S"
             )
-            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+            # 按天切分日志，保留 30 天，文件名格式：aitext.log.2026-05-12
+            file_handler = logging.handlers.TimedRotatingFileHandler(
+                log_file,
+                when="midnight",
+                interval=1,
+                backupCount=30,
+                encoding="utf-8",
+            )
+            file_handler.suffix = "%Y-%m-%d"
             file_handler.setLevel(level)
             file_handler.setFormatter(file_formatter)
             root_logger.addHandler(file_handler)

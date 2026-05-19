@@ -96,6 +96,9 @@
       <n-button v-if="needsReview" type="warning" size="small" :loading="toggling" @click="resume">
         确认大纲，继续写作
       </n-button>
+      <n-button v-if="needsReview" type="info" ghost size="small" :loading="regenerating" @click="regenerateOutline">
+        🔄 重新生成大纲
+      </n-button>
       <n-button v-if="!isRunning && !needsReview" type="primary" size="small" :loading="toggling" @click="openStartModal">
         🚀 启动全托管
       </n-button>
@@ -187,6 +190,7 @@ const message = useMessage()
 
 const status = ref(null)
 const toggling = ref(false)
+const regenerating = ref(false)
 const showStartModal = ref(false)
 const startConfig = ref({ 
   target_chapters: 100,
@@ -453,6 +457,28 @@ async function resume() {
   else { const e = await res.json(); message.error(e.detail || '恢复失败') }
   await fetchStatus()
   toggling.value = false
+}
+
+async function regenerateOutline() {
+  regenerating.value = true
+  try {
+    const res = await fetch(resolveHttpUrl(`/api/v1/novels/${props.novelId}/plan`), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'initial', dry_run: false }),
+    })
+    if (res.ok) {
+      message.success('大纲已重新生成，请在侧栏查看')
+      emit('status-change')
+    } else {
+      const e = await res.json()
+      message.error(e.detail || '重新生成大纲失败')
+    }
+  } catch (err) {
+    message.error('重新生成大纲失败，请检查网络和 AI 配置')
+  } finally {
+    regenerating.value = false
+  }
 }
 
 async function clearCircuitBreaker() {

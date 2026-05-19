@@ -94,6 +94,8 @@ export interface NovelDTO {
   auto_approve_mode?: boolean
   /** 每章目标字数（与首页建档/PUT 一致；部分接口可能未返回） */
   target_words_per_chapter?: number
+  /** 创建时间 */
+  created_at?: string
 }
 
 export const novelApi = {
