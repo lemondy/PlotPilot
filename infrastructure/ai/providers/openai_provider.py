@@ -150,10 +150,22 @@ class OpenAIProvider(BaseProvider):
                 self.async_client.chat.completions.create(**request_kwargs),
                 timeout=self.settings.timeout_seconds
             )
+            has_content = False
+            reasoning_parts = []
             async for chunk in stream:
                 content = self._extract_text_from_stream_chunk(chunk)
                 if content:
+                    has_content = True
                     yield content
+                else:
+                    # 收集 reasoning 作为 fallback（不直接输出）
+                    r = self._extract_reasoning_from_stream_chunk(chunk)
+                    if r:
+                        reasoning_parts.append(r)
+            # 如果整个流式过程 content 始终为空，用 reasoning 作为 fallback
+            if not has_content and reasoning_parts:
+                logger.warning("[Stream] content 为空，使用 reasoning_content 作为 fallback")
+                yield "".join(reasoning_parts)
         except asyncio.TimeoutError:
             logger.error(f"[Stream] Chat Completions API 连接超时 ({self.settings.timeout_seconds}s)")
             raise RuntimeError(f"Stream connection timed out after {self.settings.timeout_seconds}s")
@@ -309,6 +321,7 @@ class OpenAIProvider(BaseProvider):
 
     @staticmethod
     def _extract_text_from_stream_chunk(chunk: Any) -> str:
+        """只提取 content 字段，不提取 reasoning_content（思考过程不是正文）"""
         if not getattr(chunk, "choices", None):
             return ""
 
@@ -320,7 +333,14 @@ class OpenAIProvider(BaseProvider):
             text = OpenAIProvider._normalize_chat_completion_content(content)
             if text:
                 return text
-        # 某些代理（如 o1/gpt-5）将正文放在 reasoning_content 中
+        return ""
+
+    @staticmethod
+    def _extract_reasoning_from_stream_chunk(chunk: Any) -> str:
+        """提取 reasoning_content（仅在 content 完全为空时作为 fallback 使用）"""
+        if not getattr(chunk, "choices", None):
+            return ""
+        delta = getattr(chunk.choices[0], "delta", None)
         reasoning = getattr(delta, "reasoning_content", None)
         if isinstance(reasoning, str) and reasoning:
             return reasoning
@@ -332,6 +352,7 @@ class OpenAIProvider(BaseProvider):
         )
 
         parts: list[str] = []
+        reasoning_parts: list[str] = []
         input_tokens = 0
         output_tokens = 0
 
@@ -339,6 +360,10 @@ class OpenAIProvider(BaseProvider):
             content = self._extract_text_from_stream_chunk(chunk)
             if content:
                 parts.append(content)
+            else:
+                r = self._extract_reasoning_from_stream_chunk(chunk)
+                if r:
+                    reasoning_parts.append(r)
 
             usage = getattr(chunk, "usage", None)
             if usage is not None:
@@ -346,6 +371,10 @@ class OpenAIProvider(BaseProvider):
                 output_tokens = getattr(usage, "completion_tokens", 0) or 0
 
         content = "".join(parts).strip()
+        # content 为空时用 reasoning 作为 fallback
+        if not content and reasoning_parts:
+            logger.warning("[StreamAgg] content 为空，使用 reasoning_content 作为 fallback")
+            content = "".join(reasoning_parts).strip()
         if not content:
             raise RuntimeError("API returned empty content")
 
