@@ -17,6 +17,8 @@
               :chapters="chapters"
               :current-chapter-id="currentChapterId"
               :generation-prefs="generationPrefs"
+              :writing-chapter-number="writingChapterNumber"
+              :writing-pipeline-step="writingPipelineStep"
               @select="onSidebarChapterSelect"
               @back="goHome"
               @refresh="handleChapterUpdated"
@@ -25,36 +27,44 @@
           </template>
 
           <template #2>
-            <n-split
-              direction="horizontal"
-              :min="WORKBENCH_SPLIT.mainMin"
-              :max="WORKBENCH_SPLIT.mainMax"
-              :default-size="WORKBENCH_SPLIT.mainDefault"
-            >
-              <template #1>
-                <WorkArea
-                  ref="workAreaRef"
-                  :slug="slug"
-                  :book-title="bookTitle"
-                  :chapters="chapters"
-                  :current-chapter-id="currentChapterId"
-                  :chapter-content="chapterContent"
-                  :chapter-loading="chapterLoading"
-                  :generation-prefs="generationPrefs"
-                  @chapter-updated="handleChapterUpdated"
-                />
-              </template>
+            <div class="wb-main-split" :class="{ 'wb-right-collapsed': rightCollapsed }">
+              <n-split
+                direction="horizontal"
+                :min="WORKBENCH_SPLIT.mainMin"
+                :max="WORKBENCH_SPLIT.mainMax"
+                :default-size="WORKBENCH_SPLIT.mainDefault"
+              >
+                <template #1>
+                  <WorkArea
+                    ref="workAreaRef"
+                    :slug="slug"
+                    :book-title="bookTitle"
+                    :chapters="chapters"
+                    :current-chapter-id="currentChapterId"
+                    :chapter-content="chapterContent"
+                    :chapter-loading="chapterLoading"
+                    :generation-prefs="generationPrefs"
+                    @chapter-updated="handleChapterUpdated"
+                    @select-chapter="handleChapterSelect"
+                  />
+                </template>
 
-              <template #2>
-                <SettingsPanel
-                  :slug="slug"
-                  :current-panel="rightPanel"
-                  :current-chapter="currentChapter"
-                  :generation-prefs="generationPrefs"
-                  @update:current-panel="onSettingsPanelChange"
-                />
-              </template>
-            </n-split>
+                <template #2>
+                  <div v-if="rightCollapsed" class="wb-right-strip" @click="toggleRight">
+                    <span class="wb-strip-icon">◀</span>
+                  </div>
+                  <SettingsPanel
+                    v-else
+                    :slug="slug"
+                    :current-panel="rightPanel"
+                    :current-chapter="currentChapter"
+                    :generation-prefs="generationPrefs"
+                    @update:current-panel="onSettingsPanelChange"
+                    @collapse="toggleRight"
+                  />
+                </template>
+              </n-split>
+            </div>
           </template>
         </n-split>
       </div>
@@ -71,9 +81,10 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted, computed, ref, watch, type ComponentPublicInstance } from 'vue'
+import { onMounted, onUnmounted, computed, ref, watch, defineAsyncComponent, type ComponentPublicInstance } from 'vue'
 import { useRoute } from 'vue-router'
 import { useMessage } from 'naive-ui'
+import { useDebouncedTask } from '../composables/useDebouncedTask'
 import { useWorkbench } from '../composables/useWorkbench'
 import { useStatsStore } from '../stores/statsStore'
 import { useWorkbenchRefreshStore } from '../stores/workbenchRefreshStore'
@@ -82,7 +93,6 @@ import StatsTopBar from '../components/stats/StatsTopBar.vue'
 import ChapterList from '../components/workbench/ChapterList.vue'
 import WorkArea from '../components/workbench/WorkArea.vue'
 import SettingsPanel from '../components/workbench/SettingsPanel.vue'
-import ActPlanningModal from '../components/workbench/ActPlanningModal.vue'
 import {
   WORKBENCH_CHAPTER_DESK_CHANGE_EVENT,
   WORKBENCH_OPEN_SETTINGS_PANEL_EVENT,
@@ -90,6 +100,11 @@ import {
   isWorkbenchSettingsPanelName,
 } from '../workbench/deskEvents'
 import { WORKBENCH_SPLIT } from '../design/layoutDensity'
+import { storageKeys } from '@/config/storageKeys'
+import { runtimePerformance } from '@/config/performance'
+import { readStorageBoolean, writeStorageBoolean } from '@/utils/storage'
+
+const ActPlanningModal = defineAsyncComponent(() => import('../components/workbench/ActPlanningModal.vue'))
 
 const route = useRoute()
 const message = useMessage()
@@ -100,16 +115,19 @@ const appSettingsShell = useAppSettingsShellStore()
 const slug = computed(() => String(route.params.slug ?? ''))
 
 const chapterListRef = ref<ComponentPublicInstance<{ refreshStoryTree: () => void }> | null>(null)
-const workAreaRef = ref<ComponentPublicInstance<{ ensureAssistedMode: () => void }> | null>(null)
+const workAreaRef = ref<ComponentPublicInstance<{
+  ensureAssistedMode: () => void
+  streamingChapterNumber: import('vue').Ref<number | null>
+  writingPipelineStep: import('vue').ComputedRef<number | null>
+}> | null>(null)
+
+const writingChapterNumber = computed(() => workAreaRef.value?.streamingChapterNumber?.value ?? null)
+const writingPipelineStep = computed(() => workAreaRef.value?.writingPipelineStep?.value ?? null)
 
 async function onSidebarChapterSelect(chapterId: number, title = '') {
   await handleChapterSelect(chapterId, title)
   workAreaRef.value?.ensureAssistedMode?.()
 }
-
-/** 合并短时间内的多次「整桌刷新」：全托管状态抖动 / 多源 emit 时只拉一次 API，减轻闪烁与日志刷屏 */
-let chapterDeskReloadTimer: ReturnType<typeof setTimeout> | null = null
-const CHAPTER_DESK_RELOAD_DEBOUNCE_MS = 1100
 
 async function runChapterDeskReload() {
   await loadDesk()
@@ -119,12 +137,19 @@ async function runChapterDeskReload() {
   workbenchRefresh.bumpAfterChapterDeskChange()
 }
 
+/** 合并短时间内的多次「整桌刷新」：全托管状态抖动 / 多源 emit 时只拉一次 API，减轻闪烁与日志刷屏 */
+const chapterDeskReload = useDebouncedTask(
+  runChapterDeskReload,
+  () => runtimePerformance.workbench.deskReloadDebounceMs,
+  {
+    onError: () => {
+      message.error('刷新工作台失败，请检查网络与后端是否已启动')
+    },
+  },
+)
+
 const handleChapterUpdated = () => {
-  if (chapterDeskReloadTimer) clearTimeout(chapterDeskReloadTimer)
-  chapterDeskReloadTimer = setTimeout(() => {
-    chapterDeskReloadTimer = null
-    void runChapterDeskReload()
-  }, CHAPTER_DESK_RELOAD_DEBOUNCE_MS)
+  chapterDeskReload.schedule()
 }
 
 function onDeskChangeSignalFromPanels() {
@@ -147,6 +172,13 @@ const handlePlanAct = (actId: string, actTitle: string) => {
   actPlanningId.value = actId
   actPlanningTitle.value = actTitle
   showActPlanning.value = true
+}
+
+const rightCollapsed = ref(readStorageBoolean(storageKeys.workbenchRightPanelCollapsed))
+
+function toggleRight() {
+  rightCollapsed.value = !rightCollapsed.value
+  writeStorageBoolean(storageKeys.workbenchRightPanelCollapsed, rightCollapsed.value)
 }
 
 const {
@@ -215,10 +247,7 @@ onUnmounted(() => {
   window.removeEventListener(WORKBENCH_CHAPTER_DESK_CHANGE_EVENT, onDeskChangeSignalFromPanels)
   window.removeEventListener(WORKBENCH_OPEN_SETTINGS_PANEL_EVENT, onOpenSettingsPanelFromChild)
   window.removeEventListener(WORKBENCH_GENERATION_PREFS_UPDATED_EVENT, onGenerationPrefsUpdated)
-  if (chapterDeskReloadTimer) {
-    clearTimeout(chapterDeskReloadTimer)
-    chapterDeskReloadTimer = null
-  }
+  chapterDeskReload.cancel()
 })
 
 watch(
@@ -292,5 +321,52 @@ watch(
 .workbench-inner :deep(.n-split-pane-2) {
   min-height: 0;
   overflow: hidden;
+}
+
+/* ── Right sidebar collapse ─────────────────────────── */
+
+.wb-main-split {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+.wb-right-collapsed :deep(.n-split-pane-1) {
+  flex: 1 1 0 !important;
+  width: 0 !important;
+  max-width: none !important;
+}
+
+.wb-right-collapsed :deep(.n-split-pane-2) {
+  flex: 0 0 32px !important;
+  width: 32px !important;
+  min-width: 0 !important;
+  max-width: 32px !important;
+  overflow: hidden;
+}
+
+.wb-right-collapsed :deep(.n-split__gutter) {
+  display: none !important;
+}
+
+.wb-right-strip {
+  height: 100%;
+  width: 32px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  background: var(--app-surface);
+  border-left: 1px solid var(--plotpilot-split-border);
+  color: var(--app-text-muted);
+  font-size: 12px;
+  transition: background 0.15s, color 0.15s;
+  user-select: none;
+}
+
+.wb-right-strip:hover {
+  background: var(--plotpilot-panel-muted);
+  color: var(--app-text-primary);
 }
 </style>

@@ -14,11 +14,16 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
+from application.core.async_bridge import run_coroutine_sync
 from application.engine.services.shared_state_repository import (
     SharedStateRepository,
     ChapterSummary,
     NovelState,
     get_shared_state_repository,
+)
+from application.engine.services.state_bootstrap_settings import (
+    StateBootstrapSettings,
+    get_state_bootstrap_settings,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,8 +32,13 @@ logger = logging.getLogger(__name__)
 class StateBootstrap:
     """状态启动加载器 - 从 DB 加载所有数据到共享内存"""
 
-    def __init__(self, shared_state: Optional[SharedStateRepository] = None):
+    def __init__(
+        self,
+        shared_state: Optional[SharedStateRepository] = None,
+        settings: StateBootstrapSettings | None = None,
+    ):
         self._shared = shared_state or get_shared_state_repository()
+        self._settings = settings or get_state_bootstrap_settings()
 
     def load_all(self) -> Dict[str, Any]:
         """加载所有小说的状态到共享内存
@@ -92,7 +102,7 @@ class StateBootstrap:
             logger.error(f"加载状态失败: {e}")
 
         stats["elapsed_ms"] = round((time.time() - start_time) * 1000, 2)
-        logger.info(f"✅ 状态加载完成: {stats}")
+        logger.info(f"状态加载完成: {stats}")
         return stats
 
     def load_novel(self, novel_id: str) -> bool:
@@ -137,7 +147,7 @@ class StateBootstrap:
             from infrastructure.persistence.database.connection import get_database
 
             db = get_database()
-            # 🔥 needs_review 是计算字段：paused_for_review 或兼容值 reviewing
+            # needs_review 是计算字段：paused_for_review 或兼容值 reviewing
             rows = db.fetch_all(
                 """SELECT id, title, autopilot_status, current_stage,
                           current_act, current_chapter_in_act, current_beat_index,
@@ -165,7 +175,7 @@ class StateBootstrap:
             from infrastructure.persistence.database.connection import get_database
 
             db = get_database()
-            # 🔥 needs_review 是计算字段，不存储在数据库中
+            # needs_review 是计算字段，不存储在数据库中
             row = db.fetch_one(
                 """SELECT id, title, autopilot_status, current_stage,
                           current_act, current_chapter_in_act, current_beat_index,
@@ -189,6 +199,7 @@ class StateBootstrap:
 
     def _load_novel_state(self, novel: Dict[str, Any]) -> None:
         """加载小说状态到共享内存"""
+        macro_structure_ready = self._macro_structure_ready(novel["id"])
         state = NovelState(
             novel_id=novel["id"],
             title=novel.get("title", ""),
@@ -207,6 +218,31 @@ class StateBootstrap:
         )
 
         self._shared.set_novel_state(novel["id"], state)
+        extra = {"macro_structure_ready": macro_structure_ready}
+        if macro_structure_ready and novel.get("current_stage") in ("paused_for_review", "reviewing"):
+            extra["writing_substep"] = "macro_planning"
+            extra["writing_substep_label"] = "宏观规划 · 结构已生成"
+        if not self._shared.merge_raw_state(novel["id"], **extra):
+            logger.debug(f"写入宏观结构运行态失败（可忽略）: {novel['id']}")
+
+    def _macro_structure_ready(self, novel_id: str) -> bool:
+        """从结构表推导宏观结构是否可审阅；仅 bootstrap/加载时访问 DB。"""
+        try:
+            from infrastructure.persistence.database.connection import get_database
+
+            db = get_database()
+            row = db.fetch_one(
+                """SELECT 1
+                   FROM story_nodes
+                   WHERE novel_id = ?
+                     AND lower(node_type) = 'volume'
+                   LIMIT 1""",
+                (novel_id,),
+            )
+            return row is not None
+        except Exception as e:
+            logger.debug(f"检查宏观结构失败（可忽略）: {novel_id}, {e}")
+            return False
 
     def _load_chapters(self, novel_id: str) -> List[ChapterSummary]:
         """加载章节列表到共享内存"""
@@ -393,28 +429,10 @@ class StateBootstrap:
         """加载三元组到共享内存"""
         try:
             from infrastructure.persistence.database.triple_repository import TripleRepository
-            import asyncio
 
             repo = TripleRepository()
 
-            # 同步调用异步方法
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-
-            if loop.is_running():
-                # 如果事件循环正在运行，创建一个新的
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(
-                        asyncio.run,
-                        repo.get_by_novel(novel_id)
-                    )
-                    triples = future.result(timeout=5)
-            else:
-                triples = loop.run_until_complete(repo.get_by_novel(novel_id))
+            triples = self._run_async_triple_fetch(novel_id, lambda: repo.get_by_novel(novel_id))
 
             triples_list = [
                 {
@@ -436,6 +454,21 @@ class StateBootstrap:
             logger.debug(f"加载三元组失败（可能不存在）: {novel_id}, {e}")
             return []
 
+    def _run_async_triple_fetch(self, novel_id: str, coroutine_factory) -> List[Any]:
+        """Bridge async triple fetch with a bounded bootstrap timeout."""
+        try:
+            return run_coroutine_sync(
+                coroutine_factory,
+                timeout=self._settings.triple_fetch_timeout_seconds,
+            )
+        except TimeoutError:
+            logger.warning(
+                "加载三元组超时，跳过共享状态预热: novel=%s timeout=%ss",
+                novel_id,
+                self._settings.triple_fetch_timeout_seconds,
+            )
+            return []
+
     def _load_snapshots(self, novel_id: str) -> List[Dict[str, Any]]:
         """加载快照到共享内存"""
         try:
@@ -454,7 +487,7 @@ class StateBootstrap:
                     "chapter_number": s.get("chapter_number"),
                     "title": s.get("title", ""),
                     "story_events": s.get("story_events", []),
-                    # 🔥 补全编年史聚合所需的字段
+                    # 补全编年史聚合所需的字段
                     "name": s.get("name", ""),
                     "trigger_type": s.get("trigger_type", "AUTO"),
                     "branch_name": s.get("branch_name", "main"),

@@ -1,8 +1,10 @@
-# domain/ai/services/llm_service.py
 from abc import ABC, abstractmethod
 from typing import AsyncIterator, Dict, Optional
 from domain.ai.value_objects.prompt import Prompt
 from domain.ai.value_objects.token_usage import TokenUsage
+
+
+DEFAULT_MAX_OUTPUT_TOKENS = 120000
 
 
 class GenerationConfig:
@@ -10,7 +12,7 @@ class GenerationConfig:
     def __init__(
         self,
         model: str = "",
-        max_tokens: int = 4096,
+        max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         temperature: float = 1.0,
         response_format: Optional[Dict] = None,
     ):
@@ -26,6 +28,7 @@ class GenerationConfig:
             raise ValueError("Temperature must be between 0.0 and 2.0")
         if self.max_tokens <= 0:
             raise ValueError("max_tokens must be greater than 0")
+        self.max_tokens = max(int(self.max_tokens), DEFAULT_MAX_OUTPUT_TOKENS)
 
 
 class GenerationResult:

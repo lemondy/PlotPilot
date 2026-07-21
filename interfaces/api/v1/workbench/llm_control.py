@@ -19,6 +19,9 @@ from application.ai.llm_control_service import (
 )
 from infrastructure.ai.provider_factory import LLMProviderFactory
 from infrastructure.ai.prompt_manager import get_prompt_manager, BUILTIN_CATEGORIES
+from interfaces.api.v1.workbench.llm_control_runtime_settings import (
+    get_llm_control_runtime_settings,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix='/llm-control', tags=['llm-control'])
@@ -34,7 +37,7 @@ class ModelListRequest(BaseModel):
     protocol: str = 'openai'
     base_url: str = ''
     api_key: str = ''
-    timeout_ms: int = 30000
+    timeout_ms: Optional[int] = None
 
 
 class ModelItem(BaseModel):
@@ -105,7 +108,9 @@ async def list_models(payload: ModelListRequest) -> ModelListResponse:
         raise HTTPException(status_code=400, detail='API key is required to fetch model list')
 
     base_url = (candidate.get('base_url') or '').strip()
-    timeout = max(1.0, (candidate.get('timeout_ms') or 30000) / 1000)
+    runtime_settings = get_llm_control_runtime_settings()
+    timeout_ms = candidate.get('timeout_ms') or runtime_settings.model_list_timeout_ms
+    timeout = max(1.0, timeout_ms / 1000)
 
     if api_format == 'anthropic':
         url = f"{(base_url or 'https://api.anthropic.com').rstrip('/')}/v1/models"
@@ -166,7 +171,6 @@ async def list_models(payload: ModelListRequest) -> ModelListResponse:
 # LLM 控制面板进程级缓存（写操作时失效）
 _llm_panel_cache: Optional[LLMControlPanelData] = None
 _llm_panel_cache_ts: float = 0.0
-_LLM_PANEL_CACHE_TTL = 10.0  # 10 秒；配置低频变化，短 TTL 即可
 
 
 def _invalidate_llm_panel_cache() -> None:
@@ -183,7 +187,8 @@ async def get_llm_control_panel() -> LLMControlPanelData:
     global _llm_panel_cache, _llm_panel_cache_ts
 
     now = time.time()
-    if _llm_panel_cache is not None and (now - _llm_panel_cache_ts) < _LLM_PANEL_CACHE_TTL:
+    cache_ttl = get_llm_control_runtime_settings().panel_cache_ttl_seconds
+    if _llm_panel_cache is not None and (now - _llm_panel_cache_ts) < cache_ttl:
         return _llm_panel_cache
 
     data = _service.get_control_panel_data()
@@ -250,6 +255,11 @@ class CreateTemplateRequest(BaseModel):
     category: str = "user"
 
 
+class VariableHubBackfillRequest(BaseModel):
+    """请求体：把历史业务数据回填到 Variable Hub。"""
+    novel_id: Optional[str] = None
+
+
 # ------------------------------------------------------------------
 # 统计 & 分类
 # ------------------------------------------------------------------
@@ -257,7 +267,6 @@ class CreateTemplateRequest(BaseModel):
 # 进程级缓存：提示词广场首屏聚合数据（写操作时失效）
 _plaza_cache: Dict[str, Any] = {}
 _plaza_cache_ts: float = 0.0
-_PLAZA_CACHE_TTL = 60.0  # 秒；提示词数据变化低频，1 分钟缓存足够
 
 
 def _invalidate_plaza_cache() -> None:
@@ -278,7 +287,8 @@ async def plaza_init() -> Dict[str, Any]:
     global _plaza_cache, _plaza_cache_ts
 
     now = time.time()
-    if _plaza_cache and (now - _plaza_cache_ts) < _PLAZA_CACHE_TTL:
+    cache_ttl = get_llm_control_runtime_settings().plaza_cache_ttl_seconds
+    if _plaza_cache and (now - _plaza_cache_ts) < cache_ttl:
         return _plaza_cache
 
     mgr = get_prompt_manager()
@@ -571,7 +581,25 @@ async def get_node_detail(node_key: str) -> Dict[str, Any]:
             status_code=404,
             detail=f"Prompt node '{node_key}' not found",
         )
-    return node.to_detail_dict()
+    detail = node.to_detail_dict()
+    try:
+        from application.engine.narrative_projection.linkage_kernel import linkage_bundle
+
+        linkage = linkage_bundle()
+        detail["dag_bindings"] = [
+            row for row in linkage.get("nodes", [])
+            if row.get("cpms_node_key") == node.node_key
+        ]
+        detail["dag_registry_bindings"] = [
+            {"node_type": node_type, **meta}
+            for node_type, meta in linkage.get("registry_cpms_by_type", {}).items()
+            if meta.get("cpms_node_key") == node.node_key
+        ]
+    except Exception as exc:
+        logger.debug("DAG linkage lookup failed for prompt %s: %s", node.node_key, exc)
+        detail["dag_bindings"] = []
+        detail["dag_registry_bindings"] = []
+    return detail
 
 
 @router.post('/prompts/nodes')
@@ -977,6 +1005,32 @@ async def list_variables(
         }
         for s in all_schemas.values()
     ]
+
+
+@router.post('/prompts/variables/backfill')
+async def backfill_variable_hub(payload: VariableHubBackfillRequest) -> Dict[str, Any]:
+    """维护入口：把历史 Novel/Bible/Worldbuilding 数据补写到 Variable Hub。
+
+    回填只写缺失变量，不覆盖已有 current value。
+    """
+    from application.ai_invocation.variable_backfill import VariableHubBackfillService
+    from application.paths import get_db_path
+    from infrastructure.persistence.database.connection import get_database
+    from infrastructure.persistence.database.sqlite_ai_invocation_repository import SqliteVariableHubRepository
+    from infrastructure.persistence.database.worldbuilding_repository import WorldbuildingRepository
+    from interfaces.api.dependencies import get_bible_repository, get_novel_repository
+
+    service = VariableHubBackfillService(
+        variable_hub_repository=SqliteVariableHubRepository(get_database()),
+        novel_repository=get_novel_repository(),
+        bible_repository=get_bible_repository(),
+        worldbuilding_repository=WorldbuildingRepository(get_db_path()),
+    )
+    if payload.novel_id:
+        result = service.backfill_novel(payload.novel_id)
+    else:
+        result = service.backfill_all()
+    return result.to_dict()
 
 
 @router.get('/prompts/{node_key}/bindings')

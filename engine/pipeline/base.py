@@ -5,8 +5,8 @@
 完整管线流程（单章生成）：
  1. _step_find_next_chapter(ctx)     定位下一个待写章节
  2. _step_build_context(ctx)         组装上下文（四层洋葱挤压）
- 3. _step_magnify_beats(ctx)         节拍放大（大纲→微观节拍）
- 4. _step_generate(ctx)              LLM 生成（节拍级+断点续写）
+ 3. _step_prepare_chapter_plan(ctx)  章节执行剧本准备
+ 4. _step_generate(ctx)              LLM 整章一次生成
  5. _step_validate_content(ctx)      策略验证（反AI/俗套/一致性）
  6. _step_save_chapter(ctx)          保存章节（独立短连接写库）
  7. _step_validate_voice(ctx)        文风审计（声线漂移检测+改写）
@@ -17,13 +17,38 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC
 from typing import Any, Dict, List, Optional
 
 from engine.pipeline.context import PipelineContext, PipelineResult
+from engine.pipeline.recovery import StepCommitKind, boundary_for
 from engine.pipeline.steps import StepResult
+from engine.pipeline.telemetry import story_pipeline_wave_meta
 
 logger = logging.getLogger(__name__)
+
+def _writing_progress(
+    ctx: PipelineContext,
+    substep: str,
+    label: str,
+    *,
+    pipeline_wave_index: Optional[int] = None,
+    **extras: Any,
+) -> None:
+    """推送到全托管共享状态（writing_substep* + StoryPipeline 波次），供 /status 与 UI 管线图。"""
+    sink = getattr(ctx, "writing_progress_sink", None)
+    if sink is None:
+        return
+    payload = {k: v for k, v in extras.items() if v is not None}
+    if pipeline_wave_index is not None:
+        meta = story_pipeline_wave_meta(int(pipeline_wave_index))
+        if meta:
+            payload.update(meta)
+    try:
+        sink(substep, label, payload)
+    except Exception as e:
+        logger.debug("[%s] writing_progress_sink 失败: %s", getattr(ctx, "novel_id", "?"), e)
 
 
 class BaseStoryPipeline(ABC):
@@ -34,16 +59,17 @@ class BaseStoryPipeline(ABC):
     - VOICE_REWRITE_THRESHOLD: 声线漂移阈值
     - VOICE_REWRITE_MAX_ATTEMPTS: 定向改写最大轮数
     - MIN_PASS_SCORE: 策略验证最低通过分数
-    - BATCH_WRITE_INTERVAL: 节拍批量写库间隔
+    - BATCH_WRITE_INTERVAL: 保留给兼容运行时的批量写库间隔
     """
 
     # ─── 可覆写的类属性（调参） ───
     DEFAULT_TARGET_WORDS: int = 2500
     VOICE_REWRITE_THRESHOLD: float = 0.68
     VOICE_REWRITE_MAX_ATTEMPTS: int = 3
-    VOICE_WARNING_THRESHOLD_FALLBACK: float = 0.75
+    VOICE_WARNING_DEFAULT_THRESHOLD: float = 0.75
     MIN_PASS_SCORE: float = 0.6
     BATCH_WRITE_INTERVAL: int = 3
+    STREAM_PUSH_INTERVAL: float = 0.15
 
     def __init__(self):
         """初始化管线。子类可在此设置额外依赖。"""
@@ -70,30 +96,68 @@ class BaseStoryPipeline(ABC):
 
         try:
             # 1. 定位下一个待写章节
+            self._mark_pipeline_step(ctx, "find_next_chapter")
             r = await self._step_find_next_chapter(ctx)
             step_status["find_next_chapter"] = "ok" if r.passed else ("skipped" if r.skip else "failed")
             if not r.passed and not r.skip:
                 return self._make_result(ctx, success=False, error=r.message, step_status=step_status)
+            if r.passed:
+                _writing_progress(
+                    ctx,
+                    "chapter_found",
+                    f"章节定位 · 第 {ctx.chapter_number} 章",
+                    pipeline_wave_index=1,
+                    current_chapter_number=ctx.chapter_number,
+                    chapter_target_words=ctx.target_word_count,
+                )
 
-            # 2. 组装上下文（四层洋葱挤压）
+            # 1b. 叙事治理准备：生成章节预算与上下文请求，作为后续上下文组装的硬约束输入。
+            self._mark_pipeline_step(ctx, "prepare_governance")
+            await self._step_prepare_governance(ctx)
+
+            # 2. 章节执行剧本准备：旧数据直接复用七段，新幕级轻量链条在这里补成七段。
+            self._mark_pipeline_step(ctx, "prepare_chapter_plan")
+            r = await self._step_prepare_chapter_plan(ctx)
+            step_status["prepare_chapter_plan"] = "ok" if r.passed else "failed"
+            if not r.passed:
+                return self._make_result(ctx, success=False, error=r.message, step_status=step_status)
+            _writing_progress(
+                ctx,
+                "chapter_plan_ready",
+                "章节执行剧本准备完成",
+                pipeline_wave_index=2,
+                current_chapter_number=ctx.chapter_number,
+                total_beats=0,
+                current_beat_index=0,
+                chapter_target_words=ctx.target_word_count,
+                chapter_plan_mode=ctx.metadata.get("chapter_plan_mode") or "",
+            )
+
+            # 3. 组装上下文（四层洋葱挤压）
+            self._mark_pipeline_step(ctx, "build_context")
             r = await self._step_build_context(ctx)
             step_status["build_context"] = "ok" if r.passed else "failed"
             if not r.passed:
                 return self._make_result(ctx, success=False, error=r.message, step_status=step_status)
+            _writing_progress(
+                ctx,
+                "context_assembly",
+                "组装上下文",
+                pipeline_wave_index=3,
+                current_chapter_number=ctx.chapter_number,
+                context_tokens=int(ctx.context_tokens or 0),
+                chapter_target_words=ctx.target_word_count,
+            )
 
-            # 3. 节拍放大（大纲→微观节拍）
-            r = await self._step_magnify_beats(ctx)
-            step_status["magnify_beats"] = "ok" if r.passed else "failed"
-            if not r.passed:
-                return self._make_result(ctx, success=False, error=r.message, step_status=step_status)
-
-            # 4. LLM 生成（节拍级+断点续写）
+            # 4. LLM 生成（整章一次写完）
+            self._mark_pipeline_step(ctx, "generate")
             r = await self._step_generate(ctx)
             step_status["generate"] = "ok" if r.passed else "failed"
             if not r.passed:
                 return self._make_result(ctx, success=False, error=r.message, step_status=step_status)
 
             # 5. 策略验证（反AI/俗套/一致性）
+            self._mark_pipeline_step(ctx, "validate_content")
             r = await self._step_validate_content(ctx)
             step_status["validate_content"] = "ok" if r.passed else "warning"
             if not r.passed:
@@ -101,30 +165,36 @@ class BaseStoryPipeline(ABC):
                 # 验证失败不阻断管线，记录违规但继续
 
             # 6. 保存章节（独立短连接写库）
+            self._mark_pipeline_step(ctx, "save_chapter")
             r = await self._step_save_chapter(ctx)
             step_status["save_chapter"] = "ok" if r.passed else "failed"
             if not r.passed:
                 return self._make_result(ctx, success=False, error=r.message, step_status=step_status)
+            self._mark_pipeline_step(ctx, "save_chapter", completed=True)
 
             # 7. 文风审计（声线漂移检测+改写）
+            self._mark_pipeline_step(ctx, "validate_voice")
             r = await self._step_validate_voice(ctx)
             step_status["validate_voice"] = "ok" if r.passed else "warning"
             if not r.passed:
                 logger.warning(f"[{ctx.novel_id}] 文风审计未通过: {r.message}")
 
             # 8. 章后管线（叙事同步/向量索引/KG推断/伏笔/因果边/人物状态/债务）
+            self._mark_pipeline_step(ctx, "run_post_commit")
             r = await self._step_run_post_commit(ctx)
             step_status["run_post_commit"] = "ok" if r.passed else "warning"
             if not r.passed:
                 logger.warning(f"[{ctx.novel_id}] 章后管线失败: {r.message}")
 
             # 9. 张力打分（0-100 多维评分）
+            self._mark_pipeline_step(ctx, "score_tension")
             r = await self._step_score_tension(ctx)
             step_status["score_tension"] = "ok" if r.passed else "warning"
             if not r.passed:
                 logger.warning(f"[{ctx.novel_id}] 张力打分失败: {r.message}")
 
             # 10. 收尾（落库+状态推进）
+            self._mark_pipeline_step(ctx, "finalize")
             r = await self._step_finalize(ctx)
             step_status["finalize"] = "ok" if r.passed else "failed"
             if not r.passed:
@@ -176,11 +246,88 @@ class BaseStoryPipeline(ABC):
                     ctx.chapter_node = node
                     ctx.chapter_number = node.number
                     ctx.outline = node.outline or node.description or node.title or ""
+                    if existing is not None:
+                        old_draft = str(getattr(existing, "content", "") or "").strip()
+                        if old_draft:
+                            ctx.metadata["ignored_existing_draft_chars"] = len(old_draft)
+                        ctx.existing_content = ""
+                    try:
+                        from domain.novel.value_objects.novel_id import NovelId
+
+                        novel = (
+                            ctx.novel_repository.get_by_id(NovelId(ctx.novel_id))
+                            if ctx.novel_repository is not None
+                            else None
+                        )
+                        ctx.start_beat_index = int(getattr(novel, "current_beat_index", 0) or 0) if novel else 0
+                    except Exception:
+                        ctx.start_beat_index = 0
                     return StepResult.ok(f"定位到第 {node.number} 章")
 
             return StepResult.fail("所有章节已写完，无需继续")
         except Exception as e:
             return StepResult.fail(f"章节定位失败: {e}")
+
+    async def _step_prepare_governance(self, ctx: PipelineContext) -> StepResult:
+        """步骤1b：从叙事治理层领取本章预算。
+
+        失败不阻断生成；治理报告会在章后提交闸门再次落库。
+        """
+        try:
+            from application.governance.service import NarrativeGovernanceService
+            from infrastructure.persistence.database.connection import get_database
+            from infrastructure.persistence.database.sqlite_governance_repository import (
+                SqliteGovernanceRepository,
+            )
+            from infrastructure.persistence.database.sqlite_storyline_repository import (
+                SqliteStorylineRepository,
+            )
+
+            db = get_database()
+            governance = NarrativeGovernanceService(
+                SqliteGovernanceRepository(db),
+                ctx.novel_repository,
+                SqliteStorylineRepository(db),
+                db,
+            )
+            prepared = governance.prepare_chapter(ctx.novel_id, ctx.chapter_number)
+            ctx.governance_budget = prepared.get("budget") or {}
+            ctx.governance_context_request = prepared.get("context_request") or {}
+            ctx.metadata["governance_budget"] = ctx.governance_budget
+            ctx.metadata["governance_context_request"] = ctx.governance_context_request
+            try:
+                from application.evolution.services.gate_service import EvolutionGateService
+                from infrastructure.persistence.database.sqlite_evolution_repository import (
+                    SqliteEvolutionRepository,
+                )
+
+                continuity = EvolutionGateService(SqliteEvolutionRepository(db)).check(
+                    novel_id=ctx.novel_id,
+                    chapter_number=ctx.chapter_number,
+                    branch_id="main",
+                    outline_content=ctx.outline or "",
+                )
+                ctx.evolution_continuity_report = continuity.to_dict()
+                ctx.metadata["evolution_continuity_report"] = ctx.evolution_continuity_report
+                if not continuity.is_pass:
+                    return StepResult.fail(
+                        "写前连续性检查未通过：" + "；".join(continuity.repair_plan[:3])
+                    )
+            except Exception as gate_error:
+                logger.warning("[%s] 写前连续性检查失败: %s", ctx.novel_id, gate_error)
+            _writing_progress(
+                ctx,
+                "governance_prepare",
+                "叙事预算与连续性",
+                pipeline_wave_index=1,
+                current_chapter_number=ctx.chapter_number,
+                governance_budget=ctx.governance_budget,
+                evolution_continuity_report=ctx.evolution_continuity_report,
+            )
+            return StepResult.ok("叙事治理预算已准备")
+        except Exception as e:
+            logger.warning("[%s] 叙事治理预算准备失败: %s", ctx.novel_id, e)
+            return StepResult.skip_step(f"叙事治理预算准备失败: {e}")
 
     async def _step_build_context(self, ctx: PipelineContext) -> StepResult:
         """步骤2：组装上下文（四层洋葱挤压）
@@ -235,146 +382,231 @@ class BaseStoryPipeline(ABC):
             except Exception:
                 ctx.voice_anchors = ""
 
-        return StepResult.ok()
+        # ─── 叙事治理预算（T0 强制层）：总编辑模型给本章的结构边界 ────
+        if ctx.governance_budget:
+            budget = ctx.governance_budget
+            tags = "、".join(budget.get("must_serve_promise_tags") or [])
+            notes = "\n".join(f"- {note}" for note in (budget.get("notes") or []))
+            lines = [
+                "\n\n=== 本章叙事治理预算 ===",
+                f"- 最多新增故事线：{budget.get('max_new_storylines', 0)}",
+                f"- 最多回收叙事债务：{budget.get('max_debt_closures', 0)}",
+                f"- 允许揭秘等级：{budget.get('allowed_reveal_level', 'hint')}",
+                "- 世界线规则：优先推进、交汇或回收现有世界线；不要随意开新主线/支线/暗线。",
+                "- 新线约束：若预算允许新增，也必须由既有人物、地点、道具或未结因果触发，并在章内给出可追踪的世界切片变化。",
+                "- 回滚约束：避免写出会破坏已存档人物状态、地点占用、道具归属和已公开真相的情节。",
+            ]
+            if tags:
+                lines.append(f"- 必须服务承诺标签：{tags}")
+            if notes:
+                lines.append(notes)
+            ctx.context_text = (ctx.context_text or "") + "\n".join(lines)
 
-    async def _step_magnify_beats(self, ctx: PipelineContext) -> StepResult:
-        """步骤3：节拍放大（大纲→微观节拍）
-
-        默认实现：委托给 ContextBuilder.magnify_outline_to_beats()
-        将章节大纲拆分为多个微观节拍，每个节拍有独立的焦点和目标字数。
-
-        子类覆写场景：
-        - 短剧引擎：减少节拍数、降低每拍字数
-        - 史诗引擎：增加节拍数、每拍更多感官描写
-        """
-        self._log_step("magnify_beats", "节拍放大")
-
-        if ctx.context_builder is not None:
+        # ─── 伏笔主动注入（T0 强制层）：本章应推进/兑现的待回收伏笔 ────
+        if ctx.foreshadowing_repository is not None:
             try:
-                beat_sheet_json = None
-                bs = ctx.beat_sheet
-                if bs is not None and getattr(bs, "scenes", None):
-                    beat_sheet_json = {
-                        "scenes": [
-                            {
-                                "title": getattr(s, "title", "") or "",
-                                "goal": getattr(s, "goal", "") or "",
-                                "estimated_words": getattr(s, "estimated_words", None) or 600,
-                                "pov_character": getattr(s, "pov_character", "") or "",
-                                "location": getattr(s, "location", None),
-                                "tone": getattr(s, "tone", None),
-                                "transition_from_prev": getattr(s, "transition_from_prev", None),
-                            }
-                            for s in bs.scenes
-                        ]
-                    }
-                from application.engine.dag.plan.outline_beat_planner import (
-                    build_chapter_execution_plan_async,
-                )
-
-                chapter_plan = None
-                try:
-                    chapter_plan = await build_chapter_execution_plan_async(
-                        ctx.outline or "",
-                        target_chapter_words=ctx.target_word_count,
-                        novel_id=ctx.novel_id,
-                        chapter_number=ctx.chapter_number,
-                        beat_sheet_json=beat_sheet_json,
-                        use_llm=True,
-                        llm_service=ctx.llm_service,
-                    )
-                except Exception as e:
-                    logger.warning("章前执行计划（拆节拍）失败，降级：%s", e)
-
-                use_plan = chapter_plan is not None and bool(chapter_plan.atoms)
-                ctx.beats = ctx.context_builder.magnify_outline_to_beats(
-                    ctx.chapter_number,
-                    ctx.outline,
-                    target_chapter_words=ctx.target_word_count,
-                    chapter_execution_plan=chapter_plan if use_plan else None,
-                    beat_sheet=None if use_plan else ctx.beat_sheet,
-                    scene_director=getattr(ctx, "scene_director", None),
-                )
-                logger.info(f"[{ctx.novel_id}] 节拍拆分: {len(ctx.beats)} 个节拍")
-            except Exception as e:
-                logger.warning(f"节拍放大失败: {e}")
-                # 降级：创建单节拍
-                ctx.beats = [type('Beat', (), {
-                    'description': ctx.outline,
-                    'target_words': ctx.target_word_count,
-                    'focus': 'mixed',
-                    'expansion_hints': [],
-                    'scene_goal': '',
-                    'transition_from_prev': '',
-                })()]
-        else:
-            # 无 context_builder，创建单节拍
-            ctx.beats = [type('Beat', (), {
-                'description': ctx.outline,
-                'target_words': ctx.target_word_count,
-                'focus': 'mixed',
-                'expansion_hints': [],
-                'scene_goal': '',
-                'transition_from_prev': '',
-            })()]
+                from domain.novel.value_objects.novel_id import NovelId
+                _registry = ctx.foreshadowing_repository.get_by_novel_id(NovelId(ctx.novel_id))
+                if _registry and hasattr(_registry, "subtext_entries"):
+                    _importance_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+                    _window = ctx.chapter_number + 2
+                    _due = [
+                        e for e in _registry.subtext_entries
+                        if e.status == "pending"
+                        and e.suggested_resolve_chapter is not None
+                        and e.suggested_resolve_chapter <= _window
+                    ]
+                    _due.sort(key=lambda e: _importance_rank.get(e.importance, 2), reverse=True)
+                    if _due[:3]:
+                        _lines = "\n".join(
+                            f"- {e.question}（埋于第{e.chapter}章）"
+                            for e in _due[:3]
+                        )
+                        _fshadow_block = f"\n\n=== 本章应推进的伏笔 ===\n{_lines}"
+                        ctx.context_text = (ctx.context_text or "") + _fshadow_block
+                        logger.info(
+                            "[%s] 注入 %d 条待兑现伏笔到生成上下文",
+                            ctx.novel_id, len(_due[:3]),
+                        )
+            except Exception as _fse:
+                logger.debug("伏笔注入失败（跳过）: %s", _fse)
 
         return StepResult.ok()
+
+    async def _step_prepare_chapter_plan(self, ctx: PipelineContext) -> StepResult:
+        """步骤3：准备章节执行剧本。
+
+        旧数据若已有七段剧本则直接复用；新幕级规划只提供轻量主事件链，
+        本步骤在正文生成前补齐单章七段执行剧本。
+        """
+        self._log_step("prepare_chapter_plan", "章节执行剧本准备")
+        ctx.beats = []
+
+        outline = (ctx.outline or "").strip()
+        if not outline:
+            return StepResult.fail("章节执行剧本为空，无法整章生成")
+
+        from application.blueprint.services.chapter_planning_policy import has_rendered_chapter_execution_plan
+
+        if has_rendered_chapter_execution_plan(outline):
+            ctx.metadata["chapter_plan_mode"] = "full_chapter_script"
+            ctx.metadata["outline_plan_mode"] = "full_chapter_script"
+        else:
+            if ctx.llm_service is None:
+                return StepResult.fail("llm_service 未设置，无法生成章前执行剧本")
+            preplanning_service = ctx.get_dep("chapter_preplanning_service")
+            if preplanning_service is None:
+                from application.blueprint.services.chapter_preplanning_service import ChapterPreplanningService
+
+                preplanning_service = ChapterPreplanningService(
+                    llm_service=ctx.llm_service,
+                    chapter_repository=ctx.chapter_repository,
+                    story_node_repo=ctx.story_node_repo,
+                )
+            try:
+                outline = await preplanning_service.ensure_execution_plan(
+                    novel_id=ctx.novel_id,
+                    chapter_number=ctx.chapter_number,
+                    chapter_node=ctx.chapter_node,
+                    current_outline=outline,
+                    target_words=ctx.target_word_count,
+                )
+            except Exception as exc:
+                return StepResult.fail(f"章前执行剧本生成失败: {exc}")
+            ctx.outline = outline
+            ctx.metadata["chapter_plan_mode"] = "chapter_preplan"
+            ctx.metadata["outline_plan_mode"] = "chapter_preplan"
+
+        logger.info(
+            "[%s] 第 %s 章使用整章执行剧本生成，plan_chars=%d target_words=%d",
+            ctx.novel_id,
+            ctx.chapter_number,
+            len(outline),
+            ctx.target_word_count,
+        )
+        self._attach_chapter_preplan_metadata(ctx)
+        return StepResult.ok()
+
+    def _attach_chapter_preplan_metadata(self, ctx: PipelineContext) -> None:
+        """Expose one structured preplan source to prose generation."""
+        node_meta = getattr(ctx.chapter_node, "metadata", {}) if ctx.chapter_node is not None else {}
+        if not isinstance(node_meta, dict):
+            node_meta = {}
+        preplan = node_meta.get("chapter_preplan")
+        if not isinstance(preplan, dict):
+            preplan = {}
+
+        continuity_context = str(preplan.get("continuity_context") or "").strip()
+        if not continuity_context:
+            try:
+                from application.blueprint.services.chapter_continuity_ledger import ChapterContinuityLedgerService
+
+                continuity_context = ChapterContinuityLedgerService(
+                    chapter_repository=ctx.chapter_repository,
+                    story_node_repo=ctx.story_node_repo,
+                ).build_for_chapter(ctx.novel_id, ctx.chapter_number).to_planning_context_text()
+            except Exception:
+                continuity_context = ""
+
+        ctx.metadata["continuity_context"] = continuity_context
 
     async def _step_generate(self, ctx: PipelineContext) -> StepResult:
-        """步骤4：LLM 生成（节拍级+断点续写）
+        composer = ctx.get_dep("prose_composer")
+        if composer is not None:
+            return await self._step_generate_with_composer(ctx, composer)
+        from engine.pipeline.prose_composer import ChapterProseInvocationComposer
 
-        默认实现：逐节拍调用 LLM，支持断点续写。
-        子类可覆写 _build_generation_prompt() 修改 prompt 模板，
-        或覆写 _post_process_generation() 后处理。
+        return await self._step_generate_with_composer(ctx, ChapterProseInvocationComposer())
 
-        子类覆写场景：
-        - 覆写 _build_generation_prompt() 修改 prompt 模板
-        - 覆写 _post_process_generation() 后处理
-        """
-        self._log_step("generate", f"LLM 生成，节拍数={len(ctx.beats)}")
+    async def _step_generate_with_composer(self, ctx: PipelineContext, composer: Any) -> StepResult:
+        self._log_step("generate", "LLM 生成（整章正文 Composer）")
 
         if ctx.llm_service is None:
             return StepResult.fail("llm_service 未设置，无法生成")
 
-        accumulated_content = ctx.existing_content
-        ctx.raw_beat_contents = []
+        from engine.pipeline.prose_composer import ProseCompositionRequest
+        from application.engine.services.chapter_generation_workspace import (
+            ChapterGenerationWorkspace,
+            new_pipeline_run_id,
+        )
 
-        for i, beat in enumerate(ctx.beats):
-            if i < ctx.start_beat_index:
-                continue
+        workspace = ctx.chapter_generation_workspace or ChapterGenerationWorkspace()
+        run_id = ctx.active_pipeline_run_id or str(ctx.metadata.get("active_pipeline_run_id") or new_pipeline_run_id())
+        ctx.active_pipeline_run_id = run_id
+        ctx.chapter_generation_workspace = workspace
+        workspace.discard(ctx.novel_id, ctx.chapter_number)
+        workspace.begin(ctx.novel_id, ctx.chapter_number, run_id)
+        ctx.metadata["active_pipeline_run_id"] = run_id
+        self._mark_pipeline_step(ctx, "generate")
 
-            # 构建 prompt
-            prompt_text = self._build_generation_prompt(ctx, beat, i)
+        _writing_progress(
+            ctx,
+            "llm_calling",
+            "整章正文撰写",
+            pipeline_wave_index=4,
+            current_chapter_number=ctx.chapter_number,
+            total_beats=0,
+            current_beat_index=0,
+            chapter_target_words=ctx.target_word_count,
+            accumulated_words=len((ctx.existing_content or "").strip()),
+        )
 
-            # 调用 LLM
-            try:
-                from domain.ai.services.llm_service import GenerationConfig
-                target = getattr(beat, 'target_words', ctx.target_word_count // max(len(ctx.beats), 1))
-                max_tokens = int(target * 1.3)
-                cfg = GenerationConfig(max_tokens=max_tokens, temperature=0.85)
+        def _stream_sink(content: str) -> None:
+            workspace.append_preview(ctx.novel_id, ctx.chapter_number, run_id, content)
+            self._push_streaming_snapshot(ctx.novel_id, content)
+            _writing_progress(
+                ctx,
+                "llm_calling",
+                "整章正文撰写",
+                pipeline_wave_index=4,
+                current_chapter_number=ctx.chapter_number,
+                total_beats=0,
+                current_beat_index=0,
+                chapter_target_words=ctx.target_word_count,
+                accumulated_words=len((content or "").strip()),
+            )
 
-                result = await ctx.llm_service.generate(
-                    prompt=self._make_prompt(prompt_text),
-                    config=cfg,
-                )
-                beat_content = result.content if hasattr(result, 'content') else str(result)
+        request = ProseCompositionRequest(
+            novel_id=ctx.novel_id,
+            chapter_number=ctx.chapter_number,
+            chapter_title=str(getattr(ctx.chapter_node, "title", "") or ""),
+            novel_title=str(ctx.metadata.get("novel_title") or ctx.novel_id),
+            genre=ctx.genre,
+            outline=ctx.outline,
+            context_text=ctx.context_text,
+            style_guide=ctx.voice_anchors,
+            target_words=ctx.target_word_count,
+            auto_approve_mode=ctx.auto_approve_mode,
+            metadata=ctx.metadata,
+            stream_sink=_stream_sink,
+            stop_checker=lambda: self._novel_stream_should_stop(ctx.novel_id),
+            host=ctx.get_dep("autopilot_host") or ctx,
+            llm_service=ctx.llm_service,
+        )
+        try:
+            result = await composer.compose(request)
+        except Exception as exc:
+            logger.error("[%s] 整章 Composer 失败，停止本章生成: %s", ctx.novel_id, exc)
+            return StepResult.fail(f"整章正文生成失败: {exc}")
 
-                # 后处理
-                beat_content = self._post_process_generation(beat_content, ctx)
+        if result.awaiting_review:
+            ctx.metadata["awaiting_ai_review"] = True
+            ctx.metadata["active_invocation_session_id"] = result.session_id
+            return StepResult.fail("awaiting_ai_review")
 
-                if beat_content.strip():
-                    if accumulated_content:
-                        accumulated_content += "\n\n" + beat_content.strip()
-                    else:
-                        accumulated_content = beat_content.strip()
-                    ctx.raw_beat_contents.append(beat_content.strip())
+        if getattr(result, "interrupted", False):
+            ctx.generation_interrupted = True
+            workspace.discard(ctx.novel_id, ctx.chapter_number, run_id)
+            return StepResult.fail("interrupted")
 
-            except Exception as e:
-                logger.warning(f"[{ctx.novel_id}] 节拍 {i+1} 生成失败: {e}")
-                # 继续下一个节拍
+        content = self._post_process_generation(result.content, ctx)
+        if not content.strip():
+            return StepResult.fail("章节正文生成失败：Composer 未产出有效正文")
 
-        ctx.chapter_content = accumulated_content
-        ctx.word_count = len(accumulated_content)
+        ctx.chapter_content = content
+        ctx.word_count = len(content)
+        workspace.append_preview(ctx.novel_id, ctx.chapter_number, run_id, content)
+        self._push_streaming_snapshot(ctx.novel_id, content)
         return StepResult.ok()
 
     async def _step_validate_content(self, ctx: PipelineContext) -> StepResult:
@@ -392,6 +624,17 @@ class BaseStoryPipeline(ABC):
         - 修改验证阈值
         """
         self._log_step("validate_content", "策略验证")
+
+        _writing_progress(
+            ctx,
+            "policy_validate",
+            "策略校验（反AI·一致性）",
+            pipeline_wave_index=5,
+            current_chapter_number=ctx.chapter_number,
+            total_beats=0,
+            chapter_target_words=ctx.target_word_count,
+            accumulated_words=ctx.word_count,
+        )
 
         if ctx.policy_validator is not None:
             try:
@@ -442,21 +685,64 @@ class BaseStoryPipeline(ABC):
         if ctx.chapter_repository is None:
             return StepResult.fail("chapter_repository 未设置，无法保存")
 
+        _writing_progress(
+            ctx,
+            "chapter_persist",
+            "章节落盘",
+            pipeline_wave_index=6,
+            current_chapter_number=ctx.chapter_number,
+            total_beats=0,
+            current_beat_index=getattr(ctx, "start_beat_index", 0),
+            chapter_target_words=ctx.target_word_count,
+            accumulated_words=ctx.word_count,
+        )
+
         try:
             # 尝试推持久化队列
             pushed = self._push_persistence_command(ctx)
             if pushed:
+                self._wait_for_chapter_persistence(ctx)
+                if not self._chapter_completed_in_repository(ctx):
+                    await self._save_chapter_via_repository(ctx)
                 ctx.chapter_saved = True
                 ctx.save_method = "queue"
+                self._discard_generation_workspace(ctx)
                 return StepResult.ok()
 
             # 降级：通过 repository 直接写库
             await self._save_chapter_via_repository(ctx)
             ctx.chapter_saved = True
             ctx.save_method = "repository"
+            self._discard_generation_workspace(ctx)
             return StepResult.ok()
         except Exception as e:
             return StepResult.fail(f"章节保存失败: {e}")
+
+    def _wait_for_chapter_persistence(self, ctx: PipelineContext) -> None:
+        try:
+            from application.engine.services.persistence_queue import get_persistence_queue
+
+            pq = get_persistence_queue()
+            if pq is not None:
+                pq.wait_until_idle(timeout=5.0)
+        except Exception as exc:
+            logger.debug("[%s] wait chapter persistence skipped: %s", ctx.novel_id, exc)
+
+    def _chapter_completed_in_repository(self, ctx: PipelineContext) -> bool:
+        try:
+            from domain.novel.value_objects.novel_id import NovelId
+
+            chapter = ctx.chapter_repository.get_by_novel_and_number(
+                NovelId(ctx.novel_id),
+                int(ctx.chapter_number),
+            )
+        except Exception:
+            return False
+        if chapter is None:
+            return False
+        status = getattr(chapter, "status", "")
+        status_value = status.value if hasattr(status, "value") else str(status)
+        return status_value == "completed" and bool(str(getattr(chapter, "content", "") or "").strip())
 
     async def _step_validate_voice(self, ctx: PipelineContext) -> StepResult:
         """步骤7：文风审计（声线漂移检测+定向改写）
@@ -471,6 +757,15 @@ class BaseStoryPipeline(ABC):
         - 文学引擎：提高声线要求
         """
         self._log_step("validate_voice", "文风审计")
+
+        _writing_progress(
+            ctx,
+            "voice_drift_check",
+            "文风审计 · 声线漂移",
+            pipeline_wave_index=7,
+            current_chapter_number=ctx.chapter_number,
+            accumulated_words=ctx.word_count,
+        )
 
         if ctx.voice_drift_service is not None:
             try:
@@ -510,12 +805,31 @@ class BaseStoryPipeline(ABC):
         """
         self._log_step("run_post_commit", "章后管线")
 
+        _writing_progress(
+            ctx,
+            "chapter_aftermath",
+            "章后管线（叙事/向量/伏笔等）",
+            pipeline_wave_index=8,
+            current_chapter_number=ctx.chapter_number,
+            accumulated_words=ctx.word_count,
+            aftermath_live_status="running",
+            aftermath_live_chapter_number=ctx.chapter_number,
+        )
+
         if ctx.aftermath_pipeline is not None:
             try:
+                voice_result = None
+                if ctx.similarity_score is not None:
+                    voice_result = {
+                        "similarity_score": ctx.similarity_score,
+                        "drift_alert": ctx.drift_alert,
+                        "mode": ctx.voice_mode,
+                    }
                 result = await ctx.aftermath_pipeline.run_after_chapter_saved(
                     ctx.novel_id,
                     ctx.chapter_number,
                     ctx.chapter_content,
+                    voice_result=voice_result,
                 )
                 ctx.narrative_sync_ok = bool(result.get("narrative_sync_ok", False))
                 ctx.vector_stored = bool(result.get("vector_stored", False))
@@ -530,17 +844,63 @@ class BaseStoryPipeline(ABC):
                     ctx.similarity_score = result["similarity_score"]
                 if result.get("drift_alert") and not ctx.drift_alert:
                     ctx.drift_alert = True
+                _writing_progress(
+                    ctx,
+                    "chapter_aftermath_done",
+                    "章后管线完成",
+                    pipeline_wave_index=8,
+                    current_chapter_number=ctx.chapter_number,
+                    accumulated_words=ctx.word_count,
+                    aftermath_live_status="done",
+                    aftermath_live_chapter_number=ctx.chapter_number,
+                    narrative_sync_ok=ctx.narrative_sync_ok,
+                    vector_stored=ctx.vector_stored,
+                    foreshadow_stored=ctx.foreshadow_stored,
+                    triples_extracted=ctx.triples_extracted,
+                    causal_edges_stored=ctx.causal_edges_stored,
+                    character_mutations_stored=ctx.character_mutations_stored,
+                    debt_updated=ctx.debt_updated,
+                    tension_composite=ctx.tension_composite,
+                )
             except Exception as e:
                 logger.warning(f"章后管线失败: {e}")
-                return StepResult.ok(f"章后管线失败（降级）: {e}")
+                _writing_progress(
+                    ctx,
+                    "chapter_aftermath_failed",
+                    "章后管线失败",
+                    pipeline_wave_index=8,
+                    current_chapter_number=ctx.chapter_number,
+                    accumulated_words=ctx.word_count,
+                    aftermath_live_status="failed",
+                    aftermath_live_chapter_number=ctx.chapter_number,
+                )
+
+        await self._update_emotion_ledger(ctx)
 
         return StepResult.ok()
+
+    async def _update_emotion_ledger(self, ctx: PipelineContext) -> None:
+        """章后更新 T1 情绪账本（可选，依赖 memory_orchestrator 注入）"""
+        memory = ctx.memory_orchestrator
+        if memory is None or not ctx.chapter_content:
+            return
+        try:
+            from engine.core.entities.story import StoryId
+
+            updated = await memory.update_emotion_ledger(
+                story_id=StoryId(ctx.novel_id),
+                chapter_number=ctx.chapter_number,
+                chapter_content=ctx.chapter_content,
+            )
+            ctx.emotion_ledger_updated = updated is not None
+        except Exception as e:
+            logger.warning(f"情绪账本更新失败: {e}")
 
     async def _step_score_tension(self, ctx: PipelineContext) -> StepResult:
         """步骤9：张力打分（0-100 多维评分）
 
-        默认实现：优先使用章后管线的多维张力评分，
-        降级使用 LLM 单维评分（1-10 → ×10 转 0-100）。
+        默认实现只接受章后管线的多维张力评分。
+        不再用单维短提示词或固定 50 兜底，避免把评估失败伪装成真实心电图数据。
 
         子类覆写场景：
         - 自定义张力评分逻辑
@@ -548,21 +908,24 @@ class BaseStoryPipeline(ABC):
         """
         self._log_step("score_tension", "张力打分")
 
+        _writing_progress(
+            ctx,
+            "score_tension_live",
+            "张力评估",
+            pipeline_wave_index=9,
+            current_chapter_number=ctx.chapter_number,
+            accumulated_words=ctx.word_count,
+        )
+
         # 优先使用章后管线的多维张力
         if ctx.tension_composite is not None and ctx.tension_composite > 0:
             logger.info(f"[{ctx.novel_id}] 多维张力值：{int(ctx.tension_composite)}/100")
             return StepResult.ok()
 
-        # 降级：使用 LLM 评分
-        if ctx.llm_service is not None and ctx.chapter_content:
-            try:
-                tension = await self._score_tension_via_llm(ctx)
-                ctx.tension_composite = float(tension)
-                logger.info(f"[{ctx.novel_id}] LLM 张力值：{tension}/100")
-            except Exception as e:
-                logger.warning(f"张力打分失败: {e}")
-                ctx.tension_composite = 50.0  # 默认中等张力
-
+        logger.warning(
+            "[%s] 张力未评估：章后管线未返回有效多维张力，跳过假分写入",
+            ctx.novel_id,
+        )
         return StepResult.ok()
 
     async def _step_finalize(self, ctx: PipelineContext) -> StepResult:
@@ -578,6 +941,15 @@ class BaseStoryPipeline(ABC):
         - 添加额外的收尾操作
         """
         self._log_step("finalize", "收尾落库")
+
+        _writing_progress(
+            ctx,
+            "pipeline_finalize",
+            "收尾（状态快照）",
+            pipeline_wave_index=10,
+            current_chapter_number=ctx.chapter_number,
+            accumulated_words=ctx.word_count,
+        )
 
         # 构建审计快照
         ctx.audit_snapshot = {
@@ -599,20 +971,6 @@ class BaseStoryPipeline(ABC):
     # ═══════════════════════════════════════════════════════════════
     # 辅助方法（protected，子类可覆写）
     # ═══════════════════════════════════════════════════════════════
-
-    def _build_generation_prompt(self, ctx: PipelineContext, beat: Any, beat_index: int) -> str:
-        """构建生成 prompt — 子类可覆写以定制 prompt 模板"""
-        parts = []
-        if ctx.context_text:
-            parts.append(ctx.context_text)
-        if ctx.voice_anchors:
-            parts.append(ctx.voice_anchors)
-        if ctx.outline:
-            parts.append(f"【章节大纲】\n{ctx.outline}")
-        beat_desc = getattr(beat, 'description', str(beat))
-        beat_focus = getattr(beat, 'focus', 'mixed')
-        parts.append(f"【当前节拍 {beat_index+1}/{len(ctx.beats)}】{beat_desc} (焦点: {beat_focus})")
-        return "\n\n".join(parts)
 
     def _post_process_generation(self, content: str, ctx: PipelineContext) -> str:
         """生成后处理 — 子类可覆写以添加后处理逻辑"""
@@ -636,13 +994,101 @@ class BaseStoryPipeline(ABC):
         except ImportError:
             return content
 
-    def _make_prompt(self, text: str) -> Any:
-        """将文本转为 Prompt 对象"""
+    def _push_streaming_snapshot(self, novel_id: str, content: str) -> None:
+        """推送整章累积快照到 StreamingBus，供 /autopilot/.../chapter-stream 消费。"""
+        if not novel_id or not content:
+            return
         try:
-            from domain.ai.value_objects.prompt import Prompt
-            return Prompt(system="", user=text)
-        except ImportError:
-            return text
+            from application.engine.services.streaming_bus import streaming_bus
+
+            streaming_bus.publish(novel_id, content=content)
+        except Exception as e:
+            logger.debug("[%s] streaming_bus.publish 失败: %s", novel_id, e)
+
+    def _discard_generation_workspace(self, ctx: PipelineContext) -> None:
+        workspace = getattr(ctx, "chapter_generation_workspace", None)
+        if workspace is None:
+            return
+        try:
+            workspace.discard(ctx.novel_id, ctx.chapter_number, getattr(ctx, "active_pipeline_run_id", "") or None)
+        except Exception as e:
+            logger.debug("[%s] workspace discard failed: %s", ctx.novel_id, e)
+
+    def _mark_pipeline_step(self, ctx: PipelineContext, step_name: str, *, completed: bool = False) -> None:
+        boundary = boundary_for(step_name)
+        payload: Dict[str, Any] = {
+            "active_pipeline_step": "" if completed else step_name,
+            "active_pipeline_run_id": getattr(ctx, "active_pipeline_run_id", "") or "",
+        }
+        if completed and boundary.commit_kind == StepCommitKind.STABLE:
+            payload["current_stage"] = boundary.stable_stage
+            payload["last_stable_stage"] = boundary.stable_stage
+        elif boundary.stable_stage == "writing":
+            payload["current_stage"] = "writing"
+        host = ctx.get_dep("autopilot_host")
+        try:
+            if host is not None and hasattr(host, "_update_shared_state"):
+                host._update_shared_state(ctx.novel_id, **payload)
+        except Exception:
+            pass
+        try:
+            if host is not None and hasattr(host, "_patch_novel_ephemeral") and ctx.novel_id:
+                from domain.novel.value_objects.novel_id import NovelId
+
+                host._patch_novel_ephemeral(NovelId(ctx.novel_id), payload)
+        except Exception:
+            pass
+
+    def _novel_stream_should_stop(self, novel_id: str) -> bool:
+        """与 legacy 写作一致：IPC 停止信号 + 控制队列消费。"""
+        try:
+            from application.engine.services.novel_stop_signal import is_novel_stopped
+
+            if is_novel_stopped(novel_id):
+                return True
+        except Exception:
+            pass
+        try:
+            from application.engine.services.streaming_bus import streaming_bus
+
+            streaming_bus.consume_control_signals(novel_id)
+            from application.engine.services.novel_stop_signal import is_novel_stopped
+
+            return is_novel_stopped(novel_id)
+        except Exception:
+            return False
+
+    async def _stream_prose_llm(self, ctx: PipelineContext, prompt: Any, config: Any) -> str:
+        """Stream a single prose call and publish cumulative snapshots.
+
+        Kept as the small primitive behind whole-chapter composition tests and
+        emergency subclasses; production StoryPipeline normally enters through
+        a ProseComposer.
+        """
+        if ctx.llm_service is None:
+            return ""
+        content_parts: List[str] = []
+        last_push = time.monotonic()
+
+        def _maybe_push(*, force: bool = False) -> None:
+            nonlocal last_push
+            now = time.monotonic()
+            if not force and (now - last_push) < self.STREAM_PUSH_INTERVAL:
+                return
+            content = "".join(content_parts)
+            if content:
+                self._push_streaming_snapshot(ctx.novel_id, content)
+            last_push = now
+
+        async for piece in ctx.llm_service.stream_generate(prompt, config):
+            if self._novel_stream_should_stop(ctx.novel_id):
+                return ""
+            if not piece:
+                continue
+            content_parts.append(piece)
+            _maybe_push()
+        _maybe_push(force=True)
+        return "".join(content_parts)
 
     def _get_character_masks(self, ctx: PipelineContext) -> Dict[str, Any]:
         """获取当前章节的角色面具（供策略验证使用）"""
@@ -657,9 +1103,12 @@ class BaseStoryPipeline(ABC):
         try:
             from application.engine.services.persistence_queue import get_persistence_queue
             pq = get_persistence_queue()
-            return pq.push("save_chapter", {
+            return pq.push("upsert_chapter", {
+                "chapter_id": f"autopilot:{ctx.novel_id}:{ctx.chapter_number}",
                 "novel_id": ctx.novel_id,
                 "chapter_number": ctx.chapter_number,
+                "title": str(getattr(ctx.chapter_node, "title", "") or f"第{ctx.chapter_number}章"),
+                "outline": ctx.outline or "",
                 "content": ctx.chapter_content,
                 "word_count": ctx.word_count,
                 "status": "completed",
@@ -669,8 +1118,31 @@ class BaseStoryPipeline(ABC):
 
     async def _save_chapter_via_repository(self, ctx: PipelineContext) -> None:
         """通过 repository 保存章节"""
-        # 委托给具体的 repository 实现
-        pass
+        from domain.novel.entities.chapter import Chapter, ChapterStatus
+        from domain.novel.value_objects.novel_id import NovelId
+
+        novel_id = NovelId(ctx.novel_id)
+        existing = ctx.chapter_repository.get_by_novel_and_number(novel_id, int(ctx.chapter_number))
+        if existing is not None:
+            existing.update_content(ctx.chapter_content)
+            existing.status = ChapterStatus.COMPLETED
+            if ctx.outline:
+                existing.outline = ctx.outline
+            if getattr(ctx.chapter_node, "title", None):
+                existing.title = str(ctx.chapter_node.title)
+            ctx.chapter_repository.save(existing)
+            return
+
+        chapter = Chapter(
+            id=f"autopilot:{ctx.novel_id}:{int(ctx.chapter_number)}",
+            novel_id=novel_id,
+            number=int(ctx.chapter_number),
+            title=str(getattr(ctx.chapter_node, "title", "") or f"第{ctx.chapter_number}章"),
+            content=ctx.chapter_content,
+            outline=ctx.outline or "",
+            status=ChapterStatus.COMPLETED,
+        )
+        ctx.chapter_repository.save(chapter)
 
     async def _apply_voice_rewrite_loop(self, ctx: PipelineContext) -> None:
         """声线漂移定向改写循环"""
@@ -678,24 +1150,42 @@ class BaseStoryPipeline(ABC):
         ctx.rewrite_attempts = min(self.VOICE_REWRITE_MAX_ATTEMPTS, 1)
         # 具体改写逻辑委托给 voice_drift_service
 
-    async def _score_tension_via_llm(self, ctx: PipelineContext) -> int:
-        """通过 LLM 评分（降级方案）"""
+    async def _score_tension_via_llm(self, ctx: PipelineContext) -> Optional[int]:
+        """通过 AI Invocation 评分。
+
+        保留给子类/实验路径显式调用；默认管线不再把它作为兜底。
+        """
+        import re
+
         try:
-            prompt = self._make_prompt(
-                f"请为以下章节内容打张力分（1-10，10为最高）：\n\n{ctx.chapter_content[:2000]}\n\n张力分："
+            from application.ai_invocation.autopilot.factory import get_or_create_autopilot_helper_invoker
+            from application.ai_invocation.autopilot.helper_invoker import AutopilotHelperRequest
+            from infrastructure.ai.prompt_keys import TENSION_SCORING
+
+            owner = type("PipelineTensionInvocationOwner", (), {"llm_service": ctx.llm_service})()
+            content = await get_or_create_autopilot_helper_invoker(owner).invoke_text(
+                AutopilotHelperRequest(
+                    novel_id=str(ctx.novel_id or "global"),
+                    stage="audit",
+                    operation="autopilot.tension.score",
+                    node_key=TENSION_SCORING,
+                    explicit_variables={"content": ctx.chapter_content[:2000]},
+                    context={
+                        "novel_id": ctx.novel_id,
+                        "chapter_number": ctx.chapter_number,
+                    },
+                    metadata={"source": "story_pipeline.tension_score"},
+                    config={"max_tokens": 10, "temperature": 0.3},
+                )
             )
-            from domain.ai.services.llm_service import GenerationConfig
-            cfg = GenerationConfig(max_tokens=10, temperature=0.3)
-            result = await ctx.llm_service.generate(prompt=prompt, config=cfg)
-            content = result.content if hasattr(result, 'content') else str(result)
-            import re
-            match = re.search(r'(\d+)', content)
-            if match:
-                score = int(match.group(1))
-                return min(score, 10) * 10  # 1-10 → 0-100
-        except Exception:
-            pass
-        return 50  # 默认中等张力
+        except Exception as e:
+            logger.warning("[%s] 单维张力评分失败: %s", ctx.novel_id, e)
+            return None
+        match = re.search(r"(\d+)", str(content))
+        if not match:
+            return 50
+        score = int(match.group(1))
+        return min(score, 10) * 10  # 1-10 → 0-100
 
     def _make_result(
         self,

@@ -11,6 +11,7 @@ from domain.knowledge.story_knowledge import StoryKnowledge
 from domain.knowledge.chapter_summary import ChapterSummary
 from domain.knowledge.knowledge_triple import KnowledgeTriple
 from infrastructure.persistence.database.connection import DatabaseConnection
+from infrastructure.persistence.database.sqlite_write_settings import get_sqlite_write_settings
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +242,7 @@ class SqliteKnowledgeRepository:
                     subject_entity_id=row.get("subject_entity_id"),
                     object_entity_id=row.get("object_entity_id"),
                     provenance=list(prov_by_triple.get(tid, [])),
+                    is_starred=bool(row["is_starred"]) if row.get("is_starred") is not None else False,
                 )
             )
         return facts
@@ -251,7 +253,8 @@ class SqliteKnowledgeRepository:
         triples_sql = """
             SELECT id, subject, predicate, object, chapter_number, note,
                    entity_type, importance, location_type, description, first_appearance,
-                   confidence, source_type, subject_entity_id, object_entity_id
+                   confidence, source_type, subject_entity_id, object_entity_id,
+                   COALESCE(is_starred, 0) AS is_starred
             FROM triples
             WHERE novel_id = ?
             ORDER BY created_at ASC
@@ -475,6 +478,7 @@ class SqliteKnowledgeRepository:
         if total == 0:
             return
 
+        write_settings = get_sqlite_write_settings()
         for i in range(0, total, batch_size):
             batch = triples[i:i + batch_size]
             with self.db.transaction() as exe:
@@ -486,8 +490,8 @@ class SqliteKnowledgeRepository:
                             self._replace_triple_provenance(exe, rows)
 
             # 🔥 微事务间隙主动让出时间片，允许读请求插队
-            if i + batch_size < total:
-                time.sleep(0.01)
+            if i + batch_size < total and write_settings.micro_transaction_yield_seconds > 0:
+                time.sleep(write_settings.micro_transaction_yield_seconds)
 
     def append_triple_provenance_only(self, novel_id: str, triple_id: str, rows: List[Dict[str, Any]]) -> None:
         """仅追加溯源行（三元组行已存在）。"""

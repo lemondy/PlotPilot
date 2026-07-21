@@ -1,6 +1,7 @@
 import { apiClient } from './config'
+import { runtimePerformance } from '@/config/performance'
 
-const kgTimeout = { timeout: 60_000 }
+const kgRequestConfig = { timeout: runtimePerformance.network.mediumTaskTimeoutMs }
 
 export interface InferenceProvenanceRow {
   id: string
@@ -43,6 +44,7 @@ export interface TripleDTO {
   confidence: number
   source_type: string
   chapter_number: number | null
+  is_starred?: boolean
 }
 
 export interface KGStatistics {
@@ -61,7 +63,7 @@ export const knowledgeGraphApi = {
   ): Promise<{ success: boolean; data: ChapterInferenceEvidenceData }> {
     return apiClient.get(
       `/knowledge-graph/novels/${encodeURIComponent(novelId)}/chapters/by-number/${chapterNumber}/inference-evidence`,
-      kgTimeout,
+      kgRequestConfig,
     ) as Promise<{ success: boolean; data: ChapterInferenceEvidenceData }>
   },
 
@@ -71,7 +73,7 @@ export const knowledgeGraphApi = {
   ): Promise<{ success: boolean; data: { removed_provenance_triples: number; deleted_inferred_facts: number } }> {
     return apiClient.delete(
       `/knowledge-graph/novels/${encodeURIComponent(novelId)}/chapters/by-number/${chapterNumber}/inference`,
-      kgTimeout,
+      kgRequestConfig,
     ) as Promise<{ success: boolean; data: { removed_provenance_triples: number; deleted_inferred_facts: number } }>
   },
 
@@ -81,7 +83,7 @@ export const knowledgeGraphApi = {
   ): Promise<{ success: boolean; message: string }> {
     return apiClient.delete(
       `/knowledge-graph/novels/${encodeURIComponent(novelId)}/inferred-triples/${encodeURIComponent(tripleId)}`,
-      kgTimeout,
+      kgRequestConfig,
     ) as Promise<{ success: boolean; message: string }>
   },
 
@@ -92,7 +94,7 @@ export const knowledgeGraphApi = {
     return apiClient.post(
       `/knowledge-graph/novels/${encodeURIComponent(novelId)}/infer`,
       {},
-      kgTimeout,
+      kgRequestConfig,
     ) as Promise<{ success: boolean; data: Record<string, unknown> }>
   },
 
@@ -107,7 +109,7 @@ export const knowledgeGraphApi = {
     return apiClient.get(
       `/knowledge-graph/novels/${encodeURIComponent(novelId)}/triples`,
       {
-        ...kgTimeout,
+        ...kgRequestConfig,
         params: { ...(sourceType ? { source_type: sourceType } : {}), min_confidence: minConfidence },
       },
     ) as Promise<{ success: boolean; data: { total: number; triples: TripleDTO[] } }>
@@ -118,15 +120,24 @@ export const knowledgeGraphApi = {
     return apiClient.post(
       `/knowledge-graph/triples/${encodeURIComponent(tripleId)}/confirm`,
       {},
-      kgTimeout,
+      kgRequestConfig,
     ) as Promise<{ success: boolean; data: TripleDTO }>
+  },
+
+  /** PATCH /api/v1/knowledge-graph/novels/{id}/triples/{tripleId}/star */
+  starTriple(novelId: string, tripleId: string, starred: boolean): Promise<{ success: boolean; triple_id: string; starred: boolean }> {
+    return apiClient.patch(
+      `/knowledge-graph/novels/${encodeURIComponent(novelId)}/triples/${encodeURIComponent(tripleId)}/star`,
+      { starred },
+      kgRequestConfig,
+    ) as Promise<{ success: boolean; triple_id: string; starred: boolean }>
   },
 
   /** DELETE /api/v1/knowledge-graph/triples/{id} */
   deleteTriple(tripleId: string): Promise<{ success: boolean; message: string }> {
     return apiClient.delete(
       `/knowledge-graph/triples/${encodeURIComponent(tripleId)}`,
-      kgTimeout,
+      kgRequestConfig,
     ) as Promise<{ success: boolean; message: string }>
   },
 
@@ -136,7 +147,7 @@ export const knowledgeGraphApi = {
   getStatistics(novelId: string): Promise<{ success: boolean; data: KGStatistics }> {
     return apiClient.get(
       `/knowledge-graph/novels/${encodeURIComponent(novelId)}/statistics`,
-      kgTimeout,
+      kgRequestConfig,
     ) as Promise<{ success: boolean; data: KGStatistics }>
   },
 }

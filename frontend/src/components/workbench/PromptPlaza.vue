@@ -48,14 +48,14 @@
         :class="{ 'is-active': mainTab === 'plaza' }"
         @click="mainTab = 'plaza'"
       >
-        📝 提示词广场
+        提示词广场
       </div>
       <div
         class="main-tab"
         :class="{ 'is-active': mainTab === 'anti-ai' }"
         @click="mainTab = 'anti-ai'"
       >
-        🛡️ Anti-AI 防御
+        Anti-AI 防御
       </div>
     </div>
 
@@ -182,7 +182,7 @@
                 />
               </template>
               <template #fallback>
-                <div class="detail-panel-fallback">
+                <div class="detail-panel-loading">
                   <n-spin size="medium" description="加载编辑器…" />
                 </div>
               </template>
@@ -266,12 +266,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, reactive, nextTick, watch, defineAsyncComponent } from 'vue'
+import { ref, computed, onMounted, onUnmounted, reactive, nextTick, watch, defineAsyncComponent } from 'vue'
 import {
   NButton, NTag, NInput, NSpin, NEmpty,
   NModal, NForm, NFormItem, NSelect, NUpload, useMessage,
 } from 'naive-ui'
 import { promptPlazaApi, type PromptNode, type PromptCategoryInfo, type PromptStats, type PlazaInitResult } from '../../api/llmControl'
+import { formatApiError } from '../../utils/apiError'
+import { runtimePerformance } from '../../config/performance'
 import NodeCard from './promptPlaza/NodeCard.vue'
 
 /** 详情 / Anti-AI 惰性分包，缩短首屏解析与请求前排队的链路 */
@@ -300,6 +302,7 @@ const activeCategory = ref<string | null>(null)
 const selectedNode = ref<PromptNode | null>(null)
 const showDetailModal = ref(false)
 const detailEntering = ref(false)
+let closeDetailTimer: ReturnType<typeof setTimeout> | null = null
 const showCreateModal = ref(false)
 const showImportModal = ref(false)
 const importFileText = ref('')
@@ -369,7 +372,7 @@ const categoryOptions = computed(() =>
 async function loadData() {
   loading.value = true
   try {
-    // ★ 优化：单次聚合请求替代原来 3 次并发请求
+    // 优化：单次聚合请求替代原来 3 次并发请求
     const res = await promptPlazaApi.plazaInit() as unknown as PlazaInitResult
 
     if (res.stats) stats.value = res.stats
@@ -406,6 +409,10 @@ async function loadData() {
 }
 
 function openDetail(node: PromptNode) {
+  if (closeDetailTimer) {
+    clearTimeout(closeDetailTimer)
+    closeDetailTimer = null
+  }
   selectedNode.value = node
   showDetailModal.value = true
   // 触发进入动画
@@ -416,10 +423,14 @@ function openDetail(node: PromptNode) {
 
 function closeDetail() {
   detailEntering.value = false
-  setTimeout(() => {
+  if (closeDetailTimer) {
+    clearTimeout(closeDetailTimer)
+  }
+  closeDetailTimer = setTimeout(() => {
+    closeDetailTimer = null
     showDetailModal.value = false
     selectedNode.value = null
-  }, 200)
+  }, runtimePerformance.workbench.promptPlazaCloseAnimationMs)
 }
 
 function onNodeUpdated() {
@@ -480,8 +491,7 @@ async function handleImportJson() {
     await loadData()
     return true
   } catch (e: unknown) {
-    const err = e as { response?: { data?: { detail?: string } }; message?: string }
-    message.error(err?.response?.data?.detail || err?.message || '导入失败')
+    message.error(formatApiError(e, '导入失败'))
     return false
   }
 }
@@ -510,8 +520,8 @@ async function handleCreate() {
     Object.assign(createForm, { name: '', node_key: '', category: 'generation', system: '', user_template: '', description: '' })
     loadData()
     return true
-  } catch (e: any) {
-    message.error(e?.response?.data?.detail || '创建失败')
+  } catch (e: unknown) {
+    message.error(formatApiError(e, '创建失败'))
     return false
   }
 }
@@ -520,7 +530,14 @@ onMounted(() => {
   loadData()
 })
 
-// ★ 供外部联动调用：按 CPMS node_key 选中并打开提示词详情
+onUnmounted(() => {
+  if (closeDetailTimer) {
+    clearTimeout(closeDetailTimer)
+    closeDetailTimer = null
+  }
+})
+
+// 供外部联动调用：按 CPMS node_key 选中并打开提示词详情
 function selectNodeByKey(nodeKey: string) {
   const node = allNodes.value.find(n => n.node_key === nodeKey)
   if (node) {
@@ -619,7 +636,7 @@ defineExpose({ loadData, selectNodeByKey })
   font-weight: 600;
 }
 
-.detail-panel-fallback {
+.detail-panel-loading {
   display: flex;
   align-items: center;
   justify-content: center;

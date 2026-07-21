@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime
 from typing import Any, List, Mapping, Optional, Union
@@ -12,6 +13,7 @@ from domain.bible.triple import Triple, SourceType
 from domain.knowledge.triple_provenance import TripleProvenanceRecord
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.sqlite_knowledge_repository import SqliteKnowledgeRepository
+from infrastructure.persistence.database.sqlite_write_settings import get_sqlite_write_settings
 
 
 def _persist_source_type(st: SourceType) -> str:
@@ -134,6 +136,23 @@ class TripleRepository:
 
     def delete_triple_sync(self, triple_id: str) -> bool:
         cur = self._db.execute("DELETE FROM triples WHERE id = ?", (triple_id,))
+        self._db.get_connection().commit()
+        return cur.rowcount > 0
+
+    def get_starred_triple_ids_sync(self, novel_id: str) -> List[str]:
+        """同步：返回用户标记星标的三元组 ID 列表。"""
+        rows = self._db.fetch_all(
+            "SELECT id FROM triples WHERE novel_id = ? AND COALESCE(is_starred, 0) = 1",
+            (novel_id,),
+        )
+        return [r["id"] for r in rows]
+
+    def star_triple_sync(self, triple_id: str, starred: bool) -> bool:
+        """同步：切换三元组星标状态，返回是否找到该条目。"""
+        cur = self._db.execute(
+            "UPDATE triples SET is_starred = ? WHERE id = ?",
+            (1 if starred else 0, triple_id),
+        )
         self._db.get_connection().commit()
         return cur.rowcount > 0
 
@@ -359,18 +378,18 @@ class TripleRepository:
             triples: 三元组列表
             batch_size: 每批提交数量，默认 50。WAL 模式下小批量可让读请求"插队"。
         """
-        import time
         total = len(triples)
         if total == 0:
             return triples
 
+        write_settings = get_sqlite_write_settings()
         for i in range(0, total, batch_size):
             batch = triples[i:i + batch_size]
             for t in batch:
                 await self.save(t)
             # 🔥 微事务间隙主动让出时间片，允许 API 进程的读请求插队
             if i + batch_size < total:
-                time.sleep(0.01)
+                await asyncio.sleep(write_settings.micro_transaction_yield_seconds)
 
         return triples
 

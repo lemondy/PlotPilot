@@ -220,8 +220,11 @@ import { useMessage, useDialog } from 'naive-ui'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { chapterApi } from '../api/chapter'
+import { runtimePerformance } from '../config/performance'
+import { useDebouncedTask } from '../composables/useDebouncedTask'
 import { knowledgeGraphApi, type InferenceFactBundle } from '../api/knowledgeGraph'
 import { useStatsStore } from '../stores/statsStore'
+import { formatApiError } from '../utils/apiError'
 
 // Status mapping: old API (pending/ok/revise) <-> new API (draft/reviewed/approved)
 const statusToNew = (oldStatus: string): string => {
@@ -285,7 +288,6 @@ const content = ref('')
 const saving = ref(false)
 const saveStatus = ref<'unsaved' | 'saving' | 'saved'>('saved')
 const lastSaveTime = ref('')
-const saveTimer = ref<ReturnType<typeof setTimeout> | null>(null)
 
 const reviewStatus = ref('pending')
 const reviewMemo = ref('')
@@ -310,19 +312,23 @@ const paragraphCount = computed(() =>
 )
 
 const previewHtml = ref<string>('')
-const markdownDebounceTimer = ref<ReturnType<typeof setTimeout> | null>(null)
+
+const parseMarkdown = () => {
+  const html = marked.parse(content.value, { breaks: true, async: false }) as string
+  const sanitizedHtml = DOMPurify.sanitize(html)
+  previewHtml.value = sanitizedHtml
+}
+
+const previewTask = useDebouncedTask(
+  parseMarkdown,
+  runtimePerformance.editor.chapterPreviewDebounceMs,
+)
 
 const updatePreview = (debounce = false) => {
-  const parseMarkdown = () => {
-    const html = marked.parse(content.value, { breaks: true, async: false }) as string
-    const sanitizedHtml = DOMPurify.sanitize(html)
-    previewHtml.value = sanitizedHtml
-  }
-
   if (debounce) {
-    if (markdownDebounceTimer.value) clearTimeout(markdownDebounceTimer.value)
-    markdownDebounceTimer.value = window.setTimeout(parseMarkdown, 300)
+    previewTask.schedule()
   } else {
+    previewTask.cancel()
     parseMarkdown()
   }
 }
@@ -371,18 +377,10 @@ const handleToolSelect = (key: string) => {
   }
 }
 
-const onInput = () => {
-  saveStatus.value = 'unsaved'
-  if (saveTimer.value) clearTimeout(saveTimer.value)
-  saveTimer.value = window.setTimeout(() => {
-    void saveContent()
-  }, 30000)
-  updatePreview(true)
-}
-
-const saveContent = async () => {
+const saveContent = async (fromAutosave = false) => {
   const cid = chapterId.value
   if (cid == null || saving.value) return
+  if (fromAutosave && saveStatus.value === 'saved') return
   saving.value = true
   saveStatus.value = 'saving'
 
@@ -403,6 +401,22 @@ const saveContent = async () => {
   } finally {
     saving.value = false
   }
+}
+
+const autosaveTask = useDebouncedTask(
+  () => saveContent(true),
+  runtimePerformance.editor.chapterAutosaveMs,
+  {
+    onError: error => {
+      console.error('Autosave failed:', error)
+    },
+  },
+)
+
+const onInput = () => {
+  saveStatus.value = 'unsaved'
+  autosaveTask.schedule()
+  updatePreview(true)
 }
 
 const saveReview = async () => {
@@ -432,8 +446,8 @@ const runAiReview = async (save: boolean) => {
     reviewStatus.value = statusToOld(r.status)
     reviewMemo.value = r.memo
     message.success(save ? '已写入审定意见' : '已填入审读意见')
-  } catch (e: any) {
-    message.error(e?.response?.data?.detail || '生成失败')
+  } catch (e: unknown) {
+    message.error(formatApiError(e, '生成失败'))
   } finally {
     savingAiReview.value = false
   }
@@ -571,8 +585,8 @@ const revokeOneInference = (tripleId: string) => {
         await knowledgeGraphApi.revokeInferredTriple(slug, tripleId)
         message.success('已撤销')
         await loadInferenceEvidence()
-      } catch (err: any) {
-        message.error(err?.response?.data?.detail || '撤销失败')
+      } catch (err: unknown) {
+        message.error(formatApiError(err, '撤销失败'))
       } finally {
         revokingId.value = null
       }
@@ -591,8 +605,8 @@ const revokeAllInference = async () => {
       `已处理：删除 ${r.data.deleted_inferred_facts} 条推断三元组（涉及 ${r.data.removed_provenance_triples} 条证据关联）`
     )
     await loadInferenceEvidence()
-  } catch (err: any) {
-    message.error(err?.response?.data?.detail || '撤销失败')
+  } catch (err: unknown) {
+    message.error(formatApiError(err, '撤销失败'))
   } finally {
     revokeAllLoading.value = false
   }
@@ -602,10 +616,8 @@ watch(
   () => route.params.id,
   async () => {
     if (route.name !== 'Chapter') return
-    if (saveTimer.value) {
-      clearTimeout(saveTimer.value)
-      saveTimer.value = null
-    }
+    autosaveTask.cancel()
+    previewTask.cancel()
     pageLoading.value = true
     try {
       await loadChapter()
@@ -632,8 +644,6 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeySave)
-  if (saveTimer.value) clearTimeout(saveTimer.value)
-  if (markdownDebounceTimer.value) clearTimeout(markdownDebounceTimer.value)
 })
 </script>
 

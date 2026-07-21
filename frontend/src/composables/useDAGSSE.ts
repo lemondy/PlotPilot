@@ -2,42 +2,38 @@
  * DAG SSE 事件 composable — 性能优化版本
  *
  * 核心优化：
- * 1. 消息节流：100ms 批量处理，避免高频更新
+ * 1. 消息节流：按运行配置批量处理，避免高频更新
  * 2. 批量处理：合并多个事件，减少渲染次数
- * 3. 智能重连：指数退避，避免连接风暴
+ * 3. 连接重试集中在 dagRunStore，避免多层重连互相放大
  * 4. 性能监控：记录指标，自动告警
  */
-import { onMounted, onUnmounted, watch, type Ref } from 'vue'
+import { computed, onMounted, onUnmounted, watch, type Ref } from 'vue'
 import { useDAGStore } from '@/stores/dagStore'
 import { useDAGRunStore } from '@/stores/dagRunStore'
+import { runtimePerformance } from '@/config/performance'
 import type { NodeEvent, NodeStatus } from '@/types/dag'
 import { resolveAutopilotLogToNodeType } from '@/policies/autopilotDagLogBridge'
 
 // ─── 性能配置 ───
 
+const DAG_SSE_PERFORMANCE = runtimePerformance.dagSse
+
 /** 消息节流间隔（ms）*/
-const MESSAGE_THROTTLE_MS = 100
+const MESSAGE_THROTTLE_MS = DAG_SSE_PERFORMANCE.messageThrottleMs
 
 /** 批量处理最大队列长度 */
-const MAX_QUEUE_SIZE = 50
-
-/** SSE 重连基础延迟（ms）*/
-const RECONNECT_BASE_DELAY_MS = 1000
-
-/** SSE 重连最大延迟（ms）*/
-const RECONNECT_MAX_DELAY_MS = 30000
+const MAX_QUEUE_SIZE = DAG_SSE_PERFORMANCE.maxQueueSize
 
 /** 性能监控阈值 */
 const PERF_THRESHOLDS = {
-  queueOverflow: 50,
-  eventDropRate: 0.1,
-  renderTime: 100,
+  queueOverflow: MAX_QUEUE_SIZE,
 }
 
-export function useDAGSSE(novelId: Ref<string>) {
+export function useDAGSSE(novelId: Ref<string>, enabled?: Ref<boolean>) {
   const dagStore = useDAGStore()
   const runStore = useDAGRunStore()
   const isDev = import.meta.env.DEV
+  const shouldConnect = computed(() => enabled?.value ?? true)
 
   /** DAG 版本变化时重建 type→id，避免每条日志 O(n) 扫描 nodes */
   let typeToIdCacheVersion = -1
@@ -50,9 +46,6 @@ export function useDAGSSE(novelId: Ref<string>) {
 
   /** 节流定时器 */
   let throttleTimer: ReturnType<typeof setTimeout> | null = null
-
-  /** 重连计数器 */
-  let reconnectAttempts = 0
 
   /** 性能指标 */
   const perfMetrics = {
@@ -152,45 +145,21 @@ export function useDAGSSE(novelId: Ref<string>) {
     return Array.from(eventMap.values())
   }
 
-  /**
-   * 智能重连（指数退避）
-   */
-  function smartReconnect() {
-    reconnectAttempts++
-
-    // 指数退避
-    const delay = Math.min(
-      RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttempts - 1),
-      RECONNECT_MAX_DELAY_MS
-    )
-
-    if (isDev) {
-      console.log(`[SSE] 将在 ${delay}ms 后重连（第 ${reconnectAttempts} 次）`)
-    }
-
-    setTimeout(() => {
-      if (novelId.value) {
-        runStore.connectSSE(novelId.value)
-        runStore.connectAutopilotLog(novelId.value, handleAutopilotLogEvent)
-      }
-    }, delay)
-  }
-
   // ─── 注册回调（使用优化的批量处理）───
 
-  runStore.onNodeStatusChange((event) => {
+  const stopNodeStatus = runStore.onNodeStatusChange((event) => {
     enqueueEvent(event)
   })
 
-  runStore.onNodeOutput((event) => {
+  const stopNodeOutput = runStore.onNodeOutput((event) => {
     enqueueEvent(event)
   })
 
-  runStore.onEdgeFlow((event) => {
+  const stopEdgeFlow = runStore.onEdgeFlow((event) => {
     enqueueEvent(event)
   })
 
-  runStore.onRunComplete(() => {
+  const stopRunComplete = runStore.onRunComplete(() => {
     // 立即刷新队列
     flushQueue()
     dagStore.resetNodeStates()
@@ -200,7 +169,6 @@ export function useDAGSSE(novelId: Ref<string>) {
   watch(() => runStore.sseConnected, (connected) => {
     if (connected) {
       // 连接成功，重置重连计数
-      reconnectAttempts = 0
       if (isDev) {
         console.log('[SSE] 连接成功')
       }
@@ -209,20 +177,25 @@ export function useDAGSSE(novelId: Ref<string>) {
       if (isDev) {
         console.warn('[SSE] 连接断开')
       }
-      if (runStore.runStatus === 'running') {
-        smartReconnect()
-      }
     }
   })
 
   // ─── 生命周期 ───
 
+  function connectCurrentNovel() {
+    if (!shouldConnect.value || !novelId.value) return
+    runStore.connectSSE(novelId.value)
+    runStore.connectAutopilotLog(novelId.value, handleAutopilotLogEvent)
+    syncFromAutopilotStatus(novelId.value)
+  }
+
+  function disconnectCurrentNovel() {
+    runStore.disconnectSSE()
+    runStore.disconnectAutopilotLog()
+  }
+
   onMounted(() => {
-    if (novelId.value) {
-      runStore.connectSSE(novelId.value)
-      runStore.connectAutopilotLog(novelId.value, handleAutopilotLogEvent)
-      syncFromAutopilotStatus(novelId.value)
-    }
+    connectCurrentNovel()
   })
 
   onUnmounted(() => {
@@ -235,8 +208,11 @@ export function useDAGSSE(novelId: Ref<string>) {
     // 刷新剩余消息
     flushQueue()
 
-    runStore.disconnectSSE()
-    runStore.disconnectAutopilotLog()
+    disconnectCurrentNovel()
+    stopNodeStatus()
+    stopNodeOutput()
+    stopEdgeFlow()
+    stopRunComplete()
 
     // 输出性能指标（仅开发环境，避免生产控制台噪音）
     if (isDev && perfMetrics.eventsReceived > 0) {
@@ -254,15 +230,22 @@ export function useDAGSSE(novelId: Ref<string>) {
       // 刷新队列
       flushQueue()
 
-      runStore.disconnectSSE()
-      runStore.disconnectAutopilotLog()
+      disconnectCurrentNovel()
 
-      if (newId) {
-        reconnectAttempts = 0
+      if (newId && shouldConnect.value) {
         runStore.connectSSE(newId)
         runStore.connectAutopilotLog(newId, handleAutopilotLogEvent)
         syncFromAutopilotStatus(newId)
       }
+    }
+  })
+
+  watch(shouldConnect, (active) => {
+    flushQueue()
+    if (active) {
+      connectCurrentNovel()
+    } else {
+      disconnectCurrentNovel()
     }
   })
 

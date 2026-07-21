@@ -9,6 +9,8 @@ from application.blueprint.services.continuous_planning_service import (
     _try_parse_parts_from_llm_buffer,
     get_macro_plan_progress,
 )
+from domain.ai.value_objects.prompt import Prompt
+from domain.novel.value_objects.generation_preferences import GenerationPreferences
 
 
 def _make_service() -> ContinuousPlanningService:
@@ -17,6 +19,17 @@ def _make_service() -> ContinuousPlanningService:
         chapter_element_repo=Mock(),
         llm_service=Mock(),
     )
+
+
+def test_quick_macro_prompt_for_long_book_uses_leading_volume_detail():
+    svc = _make_service()
+
+    prompt = svc._build_quick_macro_prompt({"premise": "主角在高武世界成长。"}, 500)
+
+    assert "只为开篇前导卷规划幕节点" in prompt.system
+    assert "后续卷的幕节点留给写作过程中动态生成" in prompt.system
+    assert "开篇前导卷标题" in prompt.user
+    assert "前 1-2 部" not in prompt.system
 
 
 def test_parse_llm_response_repairs_truncated_macro_plan_json():
@@ -140,6 +153,86 @@ def test_try_parse_parts_from_llm_buffer_accepts_complete_valid_minimal_json():
     assert parts is not None
     assert parts[0]["title"] == "第一部"
     assert parts[0]["volumes"][0]["acts"][0]["title"] == "序幕"
+
+
+def test_act_planning_prompt_passes_locked_contract_variables_to_cpms(monkeypatch):
+    prefs = GenerationPreferences(
+        locked_genre="综合言情 / 都市言情·甜宠",
+        locked_world_preset="现代都市关系场域",
+        locked_special_requirements="核心回报是亲密关系推进。",
+    )
+    novel_repo = Mock()
+    novel_repo.get_by_id.return_value = Mock(generation_prefs=prefs)
+    svc = ContinuousPlanningService(
+        story_node_repo=Mock(),
+        chapter_element_repo=Mock(),
+        llm_service=Mock(),
+        novel_repository=novel_repo,
+    )
+    act_node = Mock(
+        id="act-1",
+        novel_id="novel-1",
+        title="第一幕：纸钱与樱树",
+        description="苏念把樱花看成纸钱，摩挲母亲留下的旧红绳。",
+    )
+    captured = {}
+
+    def fake_render(_contract, variables):
+        captured.update(variables)
+        return Prompt(system="system", user=str(variables))
+
+    monkeypatch.setattr(
+        ContinuousPlanningService,
+        "_render_contract_prompt",
+        staticmethod(fake_render),
+    )
+
+    prompt = svc._build_act_planning_prompt(
+        act_node=act_node,
+        bible_context={},
+        previous_summary=None,
+        chapter_count=6,
+    )
+
+    assert captured["genre_label"] == "综合言情 / 都市言情·甜宠"
+    assert captured["world_preset"] == "现代都市关系场域"
+    assert captured["special_requirements"] == "核心回报是亲密关系推进。"
+    assert "漂移禁令" not in captured["context"]
+    assert "禁止把" not in captured["context"]
+    assert prompt.user == str(captured)
+
+
+@pytest.mark.asyncio
+async def test_stream_macro_llm_text_repairs_partial_text_when_stream_breaks():
+    async def broken_stream(_prompt, _config):
+        yield """{
+          "parts": [
+            {
+              "title": "第一部",
+              "volumes": [
+                {
+                  "title": "第一卷",
+                  "acts": [
+                    {
+                      "title": "第一幕：灰鸦街醒来",
+                      "description": "主角重生后先在灰鸦街求生",
+                      "core_conflict": "隐藏异常并取得训练资格"
+                    },
+                    {
+                      "title": "第二幕：廉价训练舱",
+                      "description": "主角争夺第一批训练资源"
+        """
+        raise RuntimeError("peer closed connection")
+
+    svc = _make_service()
+    svc.llm_service.stream_generate = broken_stream
+
+    raw = await svc._stream_macro_llm_text("novel-1", Mock(), Mock())
+    parsed = svc._parse_llm_response(raw)
+
+    acts = parsed["parts"][0]["volumes"][0]["acts"]
+    assert acts[0]["title"] == "第一幕：灰鸦街醒来"
+    assert acts[1]["title"] == "第二幕：廉价训练舱"
 
 
 @pytest.mark.asyncio

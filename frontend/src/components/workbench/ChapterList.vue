@@ -24,7 +24,7 @@
       <div v-if="viewMode === 'flat'">
         <div v-if="!chapters.length" class="sidebar-empty">
           <p>暂无章节</p>
-          <p class="hint">请切换到「托管撰稿」模式，启动全托管自动生成大纲与正文</p>
+          <p class="hint">可在正文区直接生成下一章正文</p>
         </div>
         <template v-else>
           <n-list hoverable clickable>
@@ -40,6 +40,15 @@
                     <n-text depth="3" style="font-size: 12px;">{{ ch.title }}</n-text>
                     <n-tag size="small" :type="ch.word_count > 0 ? 'success' : 'default'" round>
                       {{ ch.word_count > 0 ? '已收稿' : '未收稿' }}
+                    </n-tag>
+                    <n-tag
+                      v-if="props.writingChapterNumber != null && ch.number === props.writingChapterNumber"
+                      size="small"
+                      type="info"
+                      round
+                      class="ch-writing-tag"
+                    >
+                      {{ props.writingPipelineStep ? `步骤${props.writingPipelineStep}·写作中` : '写作中' }}
                     </n-tag>
                   </div>
                 </template>
@@ -59,6 +68,7 @@
         <StoryStructureTree
           ref="storyTreeRef"
           :slug="slug"
+          :chapters="chapters"
           :current-chapter-id="currentChapterId"
           :generation-prefs="generationPrefs"
           @select-chapter="handleChapterClick"
@@ -69,10 +79,10 @@
       </div>
     </n-scrollbar>
 
-    <!-- 引导用户使用全托管 -->
+    <!-- MVP 生文空态提示 -->
     <div v-if="!chapters.length && viewMode === 'flat'" class="sidebar-foot-hint">
       <n-alert type="info" :show-icon="false" style="font-size: 12px">
-        <strong>提示</strong>：切换到「托管撰稿」模式，点击「启动全托管」即可自动生成大纲与正文
+        <strong>提示</strong>：正文区可直接生成正文
       </n-alert>
     </div>
   </aside>
@@ -88,6 +98,7 @@
 import { ref, computed, type ComponentPublicInstance } from 'vue'
 import StoryStructureTree from '@/components/StoryStructureTree.vue'
 import MacroPlanModal from '@/components/workbench/MacroPlanModal.vue'
+import { runtimePerformance } from '@/config/performance'
 import type { GenerationPrefsDTO } from '@/api/novel'
 import { narrativeOrdinalLabel, narrativeUnitNoun } from '@/utils/narrativeUnitLabel'
 
@@ -106,12 +117,16 @@ interface ChapterListProps {
   chapters: Chapter[]
   currentChapterId?: number | null
   generationPrefs?: GenerationPrefsDTO | null
+  writingChapterNumber?: number | null
+  writingPipelineStep?: number | null
 }
 
 const props = withDefaults(defineProps<ChapterListProps>(), {
   chapters: () => [],
   currentChapterId: null,
   generationPrefs: null,
+  writingChapterNumber: null,
+  writingPipelineStep: null,
 })
 
 const emit = defineEmits<{
@@ -142,8 +157,6 @@ const storyTreeRef = ref<ComponentPublicInstance<{ loadTree: () => Promise<void>
 
 /** 合并短时间内的多次刷新（全托管 desk 更新等），减轻结构树请求叠压 */
 let storyTreeRefreshTimer: ReturnType<typeof setTimeout> | null = null
-const STORY_TREE_REFRESH_DEBOUNCE_MS = 200
-
 /** 幕→章确认后由工作台调用，刷新左侧叙事结构树 */
 function refreshStoryTree() {
   if (storyTreeRefreshTimer != null) {
@@ -152,7 +165,7 @@ function refreshStoryTree() {
   storyTreeRefreshTimer = setTimeout(() => {
     storyTreeRefreshTimer = null
     void storyTreeRef.value?.loadTree?.()
-  }, STORY_TREE_REFRESH_DEBOUNCE_MS)
+  }, runtimePerformance.workbench.storyTreeRefreshDebounceMs)
 }
 
 defineExpose({ refreshStoryTree })
@@ -181,30 +194,38 @@ const handleTreeLoaded = (hasData: boolean) => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: var(--plotpilot-sidebar-pad-y) var(--plotpilot-sidebar-pad-x);
+  padding: 10px 10px 12px;
   background: var(--app-surface);
   border-right: 1px solid var(--plotpilot-split-border);
 }
 
 .sidebar-head {
-  margin-bottom: var(--plotpilot-sidebar-head-gap);
+  margin-bottom: 8px;
 }
 
 .back-btn {
-  margin-bottom: 8px;
-  font-weight: 500;
+  margin-bottom: 10px;
+  padding-left: 2px;
+  color: var(--app-text-muted);
+  font-size: 14px;
+  font-weight: 600;
 }
 
 .ico-arrow {
   font-size: 14px;
-  margin-right: 2px;
+  margin-right: 3px;
+  color: var(--app-text-muted);
 }
 
 .view-mode-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 8px;
+  margin-top: 0;
+  padding: 2px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--app-surface-subtle) 70%, transparent);
+  border: 1px solid color-mix(in srgb, var(--app-border) 55%, transparent);
 }
 
 .sidebar-title-row {
@@ -224,6 +245,7 @@ const handleTreeLoaded = (hasData: boolean) => {
 .sidebar-scroll {
   flex: 1;
   min-height: 0;
+  margin: 0 -2px;
 }
 
 .sidebar-foot-hint {
@@ -245,7 +267,7 @@ const handleTreeLoaded = (hasData: boolean) => {
 }
 
 .sidebar :deep(.n-list-item) {
-  border-radius: 10px;
+  border-radius: 6px;
   margin-bottom: 4px;
   transition: background var(--app-transition), transform 0.15s ease;
 }
@@ -263,5 +285,35 @@ const handleTreeLoaded = (hasData: boolean) => {
   padding: 8px 12px;
   text-align: center;
   border-top: 1px solid var(--app-border);
+}
+
+.ch-writing-tag {
+  animation: ch-writing-pulse 1.4s ease-in-out infinite;
+}
+
+.view-mode-row :deep(.n-base-selection) {
+  --n-border: none !important;
+  --n-border-hover: none !important;
+  --n-border-focus: none !important;
+  --n-box-shadow-focus: none !important;
+  --n-height: 32px !important;
+  background: transparent;
+}
+
+.view-mode-row :deep(.n-base-selection-label) {
+  background: transparent;
+  color: var(--app-text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.view-mode-row :deep(.n-base-selection__border),
+.view-mode-row :deep(.n-base-selection__state-border) {
+  display: none;
+}
+
+@keyframes ch-writing-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
 }
 </style>
