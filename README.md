@@ -2,35 +2,21 @@
 
 > 剧情引擎内核仍在高速演进中。欢迎提交 Issue / PR；涉及商业化封装、私有素材、未公开设定稿的内容请先脱敏。
 
-<p align="center">
-  <img src="docs/plotpilot-readme.256.png" alt="PlotPilot 墨枢" width="120" />
-</p>
 
-<p align="center">
-  <strong>开源剧情引擎内核</strong>
-</p>
 
-<p align="center">
-  面向长篇 AI 创作的基础设施：持久记忆 · 知识图谱 · 自动推进流水线 · 质量治理闭环
-</p>
+**开源剧情引擎内核**
 
-<p align="center">
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.14.x-3776AB?style=flat&logo=python&logoColor=white" alt="Python"></a>
-  <a href="https://vuejs.org/"><img src="https://img.shields.io/badge/Vue-3.5-4FC08D?style=flat&logo=vuedotjs&logoColor=white" alt="Vue"></a>
-  <a href="https://fastapi.tiangolo.com/"><img src="https://img.shields.io/badge/FastAPI-0.109%2B-009688?style=flat&logo=fastapi&logoColor=white" alt="FastAPI"></a>
-  <a href="https://github.com/shenminglinyi/PlotPilot/releases"><img src="https://img.shields.io/github/v/release/shenminglinyi/PlotPilot?style=flat&logo=github&color=6e40c9" alt="Release"></a>
-  <a href="https://github.com/shenminglinyi/PlotPilot/stargazers"><img src="https://img.shields.io/github/stars/shenminglinyi/PlotPilot?style=flat&logo=github" alt="Stars"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0%20%2B%20Commons%20Clause-D22128?style=flat&logo=apache&logoColor=white" alt="License"></a>
-</p>
+面向长篇 AI 创作的基础设施：持久记忆 · 知识图谱 · 自动推进流水线 · 质量治理闭环
+
+
 
 ---
 
-<p align="center">
-  <img src="docs/screenshots/workbench-writing.png" alt="工作台 — 写作区与知识图谱" width="49%" />
-  <img src="docs/screenshots/workbench-dag.png" alt="工作台 — 故事线 DAG 与人物设定" width="49%" />
-</p>
+
 
 ---
+
+
 
 ## 这是什么
 
@@ -51,6 +37,8 @@ PlotPilot 是一个**剧情引擎内核（Narrative Engine Kernel）**，不是�
 - **不是** 单一前端产品：官方工作台只是内核的一个使用界面，核心能力通过 REST API 暴露。
 
 ---
+
+
 
 ## 内核架构
 
@@ -98,6 +86,7 @@ PlotPilot 内核由五个相互协作的子系统构成：
 ```
 
 关键工程特性：
+
 - **单一生产入口**：`scripts/start_daemon.py` 构造依赖并启动 `EngineDaemon`
 - **可回退写作路径**：默认 `StoryPipeline` 写作，`PLOTPILOT_USE_STORY_PIPELINE=off/legacy` 可临时回退
 - **熔断保护**：连续失败超过阈值自动暂停，附带诊断信息
@@ -105,16 +94,20 @@ PlotPilot 内核由五个相互协作的子系统构成：
 - **SSE 实时推流**：生成进度、Token 消耗、当前阶段、错误信息全部通过 Server-Sent Events 实时推送到前端
 - **检查点快照**：阶段推进前自动存档，支持从任意检查点恢复
 
+
+
 ### 4. 提示词策略层（Prompt Strategy Layer）
 
 引擎暴露 **20+ 独立提示接点**，每个接点均可通过 `prompt_packages/` 下的 YAML 配置文件独立覆写：
 
-| 接点类型 | 包含接点 |
-|----------|----------|
-| 规划类 | `planning-main-plot-suggest` · `planning-quick-macro` |
-| 生成类 | `scene-director` · `chapter-narrative-sync` |
-| 知识类 | `bible-all` · `bible-characters` · `bible-locations` · `bible-worldbuilding` |
-| 分析类 | `style-analysis` · `tension-analysis-diagnosis` |
+
+| 接点类型 | 包含接点                                                                         |
+| ---- | ---------------------------------------------------------------------------- |
+| 规划类  | `planning-main-plot-suggest` · `planning-quick-macro`                        |
+| 生成类  | `scene-director` · `chapter-narrative-sync`                                  |
+| 知识类  | `bible-all` · `bible-characters` · `bible-locations` · `bible-worldbuilding` |
+| 分析类  | `style-analysis` · `tension-analysis-diagnosis`                              |
+
 
 每个提示包支持独立配置：系统提示、声线锚点、节拍约束、字数层级、记忆铁律、模型参数（temperature / top_p / max_tokens）。切换任务类型（短篇 / 长篇 / 游戏剧本）不需要修改代码，只需切换提示包目录。
 
@@ -128,6 +121,8 @@ PlotPilot 内核由五个相互协作的子系统构成：
 - **陈词滥调扫描**：规则库 + 语义相似度双重检测，标记高频套路表达
 
 ---
+
+
 
 ## 内核与生态
 
@@ -157,22 +152,30 @@ PlotPilot 内核（本仓库）
 
 ---
 
+
+
 ## 技术选型说明
 
-| 层 | 技术 | 选型理由 |
-|----|------|----------|
-| 后端框架 | FastAPI + uvicorn | 原生异步 + 自动 OpenAPI 文档，SSE 支持开箱即用 |
-| 架构范式 | DDD 分层 + 独立 `engine/` 运行内核 | 领域逻辑、用例编排、生产写作管线与技术实现分离，生态扩展不污染内核 |
-| AI 接入 | OpenAI 兼容协议 / Anthropic Claude / 火山方舟 Doubao | 统一接口抽象，模型切换不改业务代码 |
-| 向量存储 | ChromaDB（默认）/ FAISS | 本地部署，零外部依赖，冷启动快 |
-| 嵌入模型 | OpenAI 兼容 API / 本地 `bge-small-zh-v1.5` | 在线轻量与离线高性能双模式 |
-| 主数据库 | SQLite + Write Dispatch 单写者路由 | 嵌入式零依赖，并发写冲突由调度层解决 |
-| 前端 | Vue 3 + TypeScript + Vite + Naive UI + ECharts | 组件类型安全，知识图谱与 DAG 可视化由 ECharts 驱动 |
-| 桌面客户端 | Tauri（Rust） | 比 Electron 内存占用低 80%+，原生系统集成 |
+
+| 层     | 技术                                             | 选型理由                              |
+| ----- | ---------------------------------------------- | --------------------------------- |
+| 后端框架  | FastAPI + uvicorn                              | 原生异步 + 自动 OpenAPI 文档，SSE 支持开箱即用   |
+| 架构范式  | DDD 分层 + 独立 `engine/` 运行内核                     | 领域逻辑、用例编排、生产写作管线与技术实现分离，生态扩展不污染内核 |
+| AI 接入 | OpenAI 兼容协议 / Anthropic Claude / 火山方舟 Doubao   | 统一接口抽象，模型切换不改业务代码                 |
+| 向量存储  | ChromaDB（默认）/ FAISS                            | 本地部署，零外部依赖，冷启动快                   |
+| 嵌入模型  | OpenAI 兼容 API / 本地 `bge-small-zh-v1.5`         | 在线轻量与离线高性能双模式                     |
+| 主数据库  | SQLite + Write Dispatch 单写者路由                  | 嵌入式零依赖，并发写冲突由调度层解决                |
+| 前端    | Vue 3 + TypeScript + Vite + Naive UI + ECharts | 组件类型安全，知识图谱与 DAG 可视化由 ECharts 驱动  |
+| 桌面客户端 | Tauri（Rust）                                    | 比 Electron 内存占用低 80%+，原生系统集成      |
+
 
 ---
 
+
+
 ## 快速开始
+
+
 
 ### 方式一：一键启动（Windows，无需安装 Python）
 
@@ -183,6 +186,8 @@ PlotPilot 内核（本仓库）
 
 > 支持 `tools\plotpilot.bat pack` 打包整个项目分享给他人，对方双击即用。当前启动器固定使用 Python 3.14 系列；如需使用系统 Python，可设置 `PLOTPILOT_PYTHON_EXE` 指向 Python 3.14 的 `python.exe`。
 
+
+
 ### 方式二：桌面安装版（Windows · Tauri）
 
 前往 [GitHub Releases](https://github.com/shenminglinyi/PlotPilot/releases) 下载最新安装包，内含冻结后端，无需单独安装 Python。
@@ -190,6 +195,8 @@ PlotPilot 内核（本仓库）
 构建流程见 [docs/BUILD_INSTALLER.md](docs/BUILD_INSTALLER.md)。
 
 ---
+
+
 
 ## 开发者文档
 
@@ -216,34 +223,42 @@ uvicorn interfaces.main:app --host 127.0.0.1 --port 8005 --reload
 cd frontend && npm install && npm run dev
 ```
 
-| 地址 | 说明 |
-|------|------|
-| `http://127.0.0.1:8005` | 后端 API |
+
+| 地址                           | 说明           |
+| ---------------------------- | ------------ |
+| `http://127.0.0.1:8005`      | 后端 API       |
 | `http://127.0.0.1:8005/docs` | OpenAPI 交互文档 |
-| `http://localhost:3000` | 前端开发服务器 |
+| `http://localhost:3000`      | 前端开发服务器      |
+
 
 生产构建后前端由 FastAPI 静态托管（`frontend/dist`），也可独立部署。
 
 ---
 
+
+
 ## 环境变量
 
-| 变量 | 说明 |
-|------|------|
-| `LLM_PROVIDER` | 可选；指定默认 LLM 提供方 |
-| `ANTHROPIC_API_KEY` / `ARK_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` | 至少配置一个 LLM 凭证 |
-| `ARK_BASE_URL` / `ARK_MODEL`、`ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL`、`OPENAI_BASE_URL` / `OPENAI_MODEL`、`GEMINI_BASE_URL` / `GEMINI_MODEL` | 对应提供方的接口地址与模型名 |
-| `EMBEDDING_SERVICE` | `openai`（`.env.example` 默认）或 `local`（需额外安装模型，见 `requirements-local.txt`） |
-| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` | 云端嵌入服务配置；`EMBEDDING_API_KEY` 为空时可回退读取 `OPENAI_API_KEY` |
-| `EMBEDDING_MODEL_PATH` / `EMBEDDING_USE_GPU` | 本地嵌入模型路径与 GPU 开关 |
-| `VECTOR_STORE_ENABLED` / `VECTOR_STORE_TYPE` / `VECTOR_STORE_PATH` | 向量索引开关、类型与持久化目录 |
-| `CORS_ORIGINS` | 生产环境前端域名，逗号分隔 |
-| `DISABLE_AUTO_DAEMON` | 设为 `1` 禁止启动时自动拉起守护进程 |
-| `LOG_LEVEL` / `LOG_FILE` | 日志级别与路径 |
 
-完整说明见 [`.env.example`](.env.example)。
+| 变量                                                                                                                                          | 说明                                                                       |
+| ------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `LLM_PROVIDER`                                                                                                                              | 可选；指定默认 LLM 提供方                                                          |
+| `ANTHROPIC_API_KEY` / `ARK_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY`                                                                   | 至少配置一个 LLM 凭证                                                            |
+| `ARK_BASE_URL` / `ARK_MODEL`、`ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL`、`OPENAI_BASE_URL` / `OPENAI_MODEL`、`GEMINI_BASE_URL` / `GEMINI_MODEL` | 对应提供方的接口地址与模型名                                                           |
+| `EMBEDDING_SERVICE`                                                                                                                         | `openai`（`.env.example` 默认）或 `local`（需额外安装模型，见 `requirements-local.txt`） |
+| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL`                                                                              | 云端嵌入服务配置；`EMBEDDING_API_KEY` 为空时可回退读取 `OPENAI_API_KEY`                   |
+| `EMBEDDING_MODEL_PATH` / `EMBEDDING_USE_GPU`                                                                                                | 本地嵌入模型路径与 GPU 开关                                                         |
+| `VECTOR_STORE_ENABLED` / `VECTOR_STORE_TYPE` / `VECTOR_STORE_PATH`                                                                          | 向量索引开关、类型与持久化目录                                                          |
+| `CORS_ORIGINS`                                                                                                                              | 生产环境前端域名，逗号分隔                                                            |
+| `DISABLE_AUTO_DAEMON`                                                                                                                       | 设为 `1` 禁止启动时自动拉起守护进程                                                     |
+| `LOG_LEVEL` / `LOG_FILE`                                                                                                                    | 日志级别与路径                                                                  |
+
+
+完整说明见 `[.env.example](.env.example)`。
 
 ---
+
+
 
 ## 架构目录
 
@@ -318,6 +333,8 @@ cd frontend && npm install && npm run dev
 
 ---
 
+
+
 ## 测试
 
 ```bash
@@ -327,6 +344,8 @@ pytest tests/ --cov=. --cov-report=term-missing
 ```
 
 ---
+
+
 
 ## 贡献指南
 
@@ -338,6 +357,8 @@ pytest tests/ --cov=. --cov-report=term-missing
 架构与分层说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)；其余文档索引见 [docs/README.md](docs/README.md)。
 
 ---
+
+
 
 ## 提交安全边界
 
@@ -352,16 +373,20 @@ pytest tests/ --cov=. --cov-report=term-missing
 
 ---
 
+
+
 ## 生态共建 (Community & Contribution)
 
 PlotPilot 引擎仍在持续演进中，我们始终致力于用工程化手段解决复杂的创作状态管理问题。我们正在寻找对“叙事工程”与“大模型复杂系统架构”感兴趣的极客同行。
 
 **当前生态演进方向**：内核引擎研发、生态应用构建、提示词工程、前端工作台。如果你有志于共建，欢迎通过以下方式参与：
 
-*   **核心代码与架构共建：** 请直接在 GitHub 提交 Issue 或 PR，引擎核心维护组会定期 Review。
-*   **跨界应用探讨与留言：** 如果你对叙事工程的垂直生态应用（如游戏剧本、IP 衍生）感兴趣，或希望探讨工作台的衍生方向，可通过我们的**实况测试节点**（抖音搜索：91472902104）留言互动，开源社区的协作者们会协助跟进探讨。
+- **核心代码与架构共建：** 请直接在 GitHub 提交 Issue 或 PR，引擎核心维护组会定期 Review。
+- **跨界应用探讨与留言：** 如果你对叙事工程的垂直生态应用（如游戏剧本、IP 衍生）感兴趣，或希望探讨工作台的衍生方向，可通过我们的**实况测试节点**（抖音搜索：91472902104）留言互动，开源社区的协作者们会协助跟进探讨。
 
 ---
+
+
 
 ## 许可证
 
@@ -373,3 +398,4 @@ PlotPilot 引擎仍在持续演进中，我们始终致力于用工程化手段�
 详见 [LICENSE](LICENSE)。
 
 ---
+
